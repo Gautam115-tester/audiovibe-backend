@@ -6,29 +6,32 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# Load environment variables
+# 1. Load Environment Variables
 load_dotenv()
 
 app = FastAPI()
 
 # --- CONFIGURATION & SECRETS ---
-# These are loaded from the server's environment variables
+# These must be set in your Render Environment Variables
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # The secret admin key
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # Secret Admin Key
 
 # Validation
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    print("CRITICAL WARNING: Supabase credentials not found.")
+    print("⚠️ CRITICAL: Supabase credentials missing in environment variables.")
 
-# Initialize Supabase Client with Admin privileges
+# Initialize Supabase Client
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 except Exception as e:
-    print(f"Failed to init Supabase: {e}")
+    print(f"⚠️ Failed to init Supabase: {e}")
 
-# --- DATA MODELS (Pydantic) ---
-# These define what data the Flutter app sends to us
+# --- SECURITY CONSTANTS ---
+# Must match the value in your Flutter SecurityService
+EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
+
+# --- DATA MODELS ---
 
 class SongRequest(BaseModel):
     artist: str
@@ -54,41 +57,52 @@ class PlayRecord(BaseModel):
 
 @app.get("/")
 def read_root():
-    """Health check endpoint to ensure server is running."""
-    return {"status": "Audio Vibe Backend Active"}
+    """Health check endpoint (public)."""
+    return {"status": "Audio Vibe Backend Active & Secure"}
 
-# 1. PROXY: Get All Tracks
+# 1. PROXY: Get All Tracks (Protected)
 @app.get("/tracks")
-async def get_tracks():
+async def get_tracks(x_app_integrity: str = Header(None)):
+    # Security Check
+    if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
+        raise HTTPException(status_code=403, detail="Security Check Failed")
+
     try:
-        # Select all tracks, ordered by newest first
         response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
         return response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supabase Error: {str(e)}")
 
-# 2. PROXY: Add New Track (Secure Admin Action)
+# 2. PROXY: Add New Track (Protected Admin Action)
 @app.post("/tracks")
-async def add_track(track: TrackUpload):
+async def add_track(track: TrackUpload, x_app_integrity: str = Header(None)):
+    # Security Check
+    if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
+        print(f"⛔ Blocked Upload Request: Invalid Header '{x_app_integrity}'")
+        raise HTTPException(status_code=403, detail="Security Check Failed")
+
     try:
-        # Convert Pydantic model to dictionary
         data = track.dict()
-        # Insert into Supabase
+        # Secure Insert using Service Role Key
         response = supabase.table("music_tracks").insert(data).execute()
         return {"status": "success", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Insert Failed: {str(e)}")
 
-# 3. PROXY: Record Play Stats
+# 3. PROXY: Record Play Stats (Protected)
 @app.post("/record-play")
-async def record_play(stat: PlayRecord):
+async def record_play(stat: PlayRecord, x_app_integrity: str = Header(None)):
+    # Security Check
+    if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
+        print("⛔ Blocked Stats Request: Invalid Header")
+        raise HTTPException(status_code=403, detail="Security Check Failed")
+
     try:
-        # Calculate completion rate logic here to keep Flutter logic thin
         completion_rate = 0.0
         if stat.total_duration_ms > 0:
             completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms)
 
-        # Call the RPC function defined in Supabase SQL
+        # Call Supabase RPC
         response = supabase.rpc('upsert_listening_stat', {
             'p_user_id': stat.user_id,
             'p_track_id': stat.track_id,
@@ -98,19 +112,24 @@ async def record_play(stat: PlayRecord):
         
         return {"status": "recorded"}
     except Exception as e:
-        # Log error but don't crash app flow for stats
         print(f"Stats Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Don't crash app flow for stats errors
+        return {"status": "error", "detail": str(e)}
 
-# 4. AI ENRICHMENT (Grok Proxy)
+# 4. AI ENRICHMENT (Protected Grok Call)
 @app.post("/enrich-metadata")
-async def enrich_metadata(song: SongRequest):
+async def enrich_metadata(song: SongRequest, x_app_integrity: str = Header(None)):
+    # 1. Security Check
+    if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
+        print("⛔ Blocked Grok Request: Hacker detected or Insecure Device")
+        raise HTTPException(status_code=403, detail="Security Check Failed")
+
+    # 2. Validation
     if not GROK_API_KEY:
-        raise HTTPException(status_code=500, detail="Server Error: Grok Key missing")
+        raise HTTPException(status_code=500, detail="Server Error: Grok API Key missing")
 
     url = "https://api.x.ai/v1/chat/completions"
     
-    # Strict prompt for formatting
     prompt = (
         f"Analyze the song '{song.title}' by '{song.artist}'. "
         "Return ONLY a single string in this exact format: "
@@ -131,7 +150,7 @@ async def enrich_metadata(song: SongRequest):
     }
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {GROK_API_KEY}",
         "Content-Type": "application/json"
     }
 
@@ -145,7 +164,7 @@ async def enrich_metadata(song: SongRequest):
             content = data['choices'][0]['message']['content'].strip()
             parts = content.split(';')
             
-            # Handle potential AI formatting errors gracefully
+            # Basic validation to ensure AI followed instructions
             if len(parts) < 3:
                 return {
                     "formatted": content, 
