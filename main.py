@@ -275,7 +275,7 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
     prompt = (
         f"Analyze the song '{song.title}' by '{song.artist}'{album_info}. "
         "Provide ONLY these three items separated by semicolons:\n"
-        "1. Primary mood (one word: e.g., Energetic, Melancholic, Upbeat, Chill, Aggressive, Romantic, Dark, Peaceful)\n"
+        "1. Primary mood (one word: e.g., Energetic, Melancholic, Upbeat, Chill, Romantic, Dark, Peaceful, sad, relaxed, joyful, cheerful)\n"
         "2. Primary language (e.g., English, Spanish, Hindi, Korean, Japanese, French)\n"
         "3. Primary genre (e.g., Rock, Pop, Hip-Hop, Classical, Jazz, Electronic, Metal, R&B, Country)\n\n"
         "Format: Mood;Language;Genre\n"
