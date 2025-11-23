@@ -61,6 +61,8 @@ GROQ_MODELS = {
     "fallback": "mixtral-8x7b-32768"
 }
 
+metadata_cache = {}
+
 class SongRequest(BaseModel):
     artist: str
     title: str
@@ -260,6 +262,12 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="Server Error: GROQ_API_KEY missing")
 
+    cache_key = f"{song.artist.lower()}:{song.title.lower()}"
+    
+    if cache_key in metadata_cache:
+        print(f"Using cached result for '{song.title}' by '{song.artist}'")
+        return metadata_cache[cache_key]
+
     print(f"Enrichment request: '{song.title}' by '{song.artist}'")
 
     album_info = f" from album '{song.album}'" if song.album else ""
@@ -280,7 +288,7 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a music analysis expert. Respond ONLY with the format requested, no explanation."
+                    "content": "You are a music analysis expert. Respond ONLY with the format requested, no explanation. Be consistent in your analysis."
                 },
                 {
                     "role": "user", 
@@ -288,8 +296,9 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
                 }
             ],
             model=GROQ_MODELS["primary"],
-            temperature=0.3,
+            temperature=0.0,
             max_tokens=50,
+            seed=42
         )
 
         content = chat_completion.choices[0].message.content.strip()
@@ -316,6 +325,8 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
             "language": language,
             "genre": genre
         }
+        
+        metadata_cache[cache_key] = result
         
         print(f"Returning: {result}")
         return result
