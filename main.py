@@ -2,9 +2,9 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import List, Optional
 import os
-import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from groq import Groq  # ✅ Import Groq
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -12,27 +12,31 @@ load_dotenv()
 app = FastAPI()
 
 # --- CONFIGURATION & SECRETS ---
-# These must be set in your Render Environment Variables
-GROK_API_KEY = os.getenv("GROK_API_KEY")
+# ✅ Load GROQ_API_KEY instead of GROK_API_KEY
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # Secret Admin Key
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 # Validation
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    print("⚠️ CRITICAL: Supabase credentials missing in environment variables.")
+    print("⚠️ CRITICAL: Supabase credentials missing.")
 
-# Initialize Supabase Client
+if not GROQ_API_KEY:
+    print("⚠️ CRITICAL: GROQ_API_KEY missing.")
+
+# Initialize Clients
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 except Exception as e:
     print(f"⚠️ Failed to init Supabase: {e}")
 
+# Initialize Groq Client
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 # --- SECURITY CONSTANTS ---
-# Must match the value in your Flutter SecurityService
 EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
 
 # --- DATA MODELS ---
-
 class SongRequest(BaseModel):
     artist: str
     title: str
@@ -57,52 +61,41 @@ class PlayRecord(BaseModel):
 
 @app.get("/")
 def read_root():
-    """Health check endpoint (public)."""
-    return {"status": "Audio Vibe Backend Active & Secure"}
+    return {"status": "Audio Vibe Backend Active (Groq Edition)"}
 
-# 1. PROXY: Get All Tracks (Protected)
+# 1. PROXY: Get All Tracks
 @app.get("/tracks")
 async def get_tracks(x_app_integrity: str = Header(None)):
-    # Security Check
     if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
         raise HTTPException(status_code=403, detail="Security Check Failed")
-
     try:
         response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
         return response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supabase Error: {str(e)}")
 
-# 2. PROXY: Add New Track (Protected Admin Action)
+# 2. PROXY: Add New Track
 @app.post("/tracks")
 async def add_track(track: TrackUpload, x_app_integrity: str = Header(None)):
-    # Security Check
     if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
-        print(f"⛔ Blocked Upload Request: Invalid Header '{x_app_integrity}'")
         raise HTTPException(status_code=403, detail="Security Check Failed")
-
     try:
         data = track.dict()
-        # Secure Insert using Service Role Key
         response = supabase.table("music_tracks").insert(data).execute()
         return {"status": "success", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Insert Failed: {str(e)}")
 
-# 3. PROXY: Record Play Stats (Protected)
+# 3. PROXY: Record Play Stats
 @app.post("/record-play")
 async def record_play(stat: PlayRecord, x_app_integrity: str = Header(None)):
-    # Security Check
     if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
-        print("⛔ Blocked Stats Request: Invalid Header")
         raise HTTPException(status_code=403, detail="Security Check Failed")
-
     try:
         completion_rate = 0.0
         if stat.total_duration_ms > 0:
             completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms)
 
-        # Call Supabase RPC
         response = supabase.rpc('upsert_listening_stat', {
             'p_user_id': stat.user_id,
             'p_track_id': stat.track_id,
@@ -113,76 +106,57 @@ async def record_play(stat: PlayRecord, x_app_integrity: str = Header(None)):
         return {"status": "recorded"}
     except Exception as e:
         print(f"Stats Error: {e}")
-        # Don't crash app flow for stats errors
         return {"status": "error", "detail": str(e)}
 
-# 4. AI ENRICHMENT (Protected Grok Call)
+# 4. AI ENRICHMENT (Using Groq)
 @app.post("/enrich-metadata")
 async def enrich_metadata(song: SongRequest, x_app_integrity: str = Header(None)):
-    # 1. Security Check
     if x_app_integrity != EXPECTED_INTEGRITY_HEADER:
-        print("⛔ Blocked Grok Request: Hacker detected or Insecure Device")
         raise HTTPException(status_code=403, detail="Security Check Failed")
 
-    # 2. Validation
-    if not GROK_API_KEY:
-        raise HTTPException(status_code=500, detail="Server Error: Grok API Key missing")
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="Server Error: GROQ_API_KEY missing")
 
-    url = "https://api.x.ai/v1/chat/completions"
-    
     prompt = (
         f"Analyze the song '{song.title}' by '{song.artist}'. "
         "Return ONLY a single string in this exact format: "
         "'Mood;Language;Genre'. "
-        "Use standard moods: Romantic, Sad, Party, Chill, Intense, Happy. "
-        "Example response: 'Party;Punjabi;Bhangra'. "
+        "Example: 'Energetic;English;Pop'. "
         "No intro text."
     )
 
-    payload = {
-        "messages": [
-            {"role": "system", "content": "You are a music metadata expert."},
-            {"role": "user", "content": prompt}
-        ],
-        "model": "grok-beta",
-        "stream": False,
-        "temperature": 0.3
-    }
+    try:
+        # ✅ Call Groq API
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a music metadata expert. Return only the requested format."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama3-8b-8192", # Fast and efficient model
+            temperature=0.3,
+        )
 
-    headers = {
-        "Authorization": f"Bearer {GROK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=payload, headers=headers, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Parse Content
-            content = data['choices'][0]['message']['content'].strip()
-            parts = content.split(';')
-            
-            # Basic validation to ensure AI followed instructions
-            if len(parts) < 3:
-                return {
-                    "formatted": content, 
-                    "mood": "Unknown", 
-                    "language": "Unknown", 
-                    "genre": "Unknown"
-                }
-
+        content = chat_completion.choices[0].message.content.strip()
+        parts = content.split(';')
+        
+        if len(parts) < 3:
             return {
-                "formatted": content,
-                "mood": parts[0].strip(),
-                "language": parts[1].strip(),
-                "genre": parts[2].strip()
+                "formatted": content, 
+                "mood": "Unknown", 
+                "language": "Unknown", 
+                "genre": "Unknown"
             }
 
-        except Exception as e:
-            print(f"AI Error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "formatted": content,
+            "mood": parts[0].strip(),
+            "language": parts[1].strip(),
+            "genre": parts[2].strip()
+        }
+
+    except Exception as e:
+        print(f"Groq AI Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
