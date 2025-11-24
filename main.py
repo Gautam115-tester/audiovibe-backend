@@ -408,16 +408,18 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
         print(f"⚠️ Groq error: {e}")
         mood, language, genre = "Neutral", "Unknown", "Pop"
 
-    # Final result
+    # Final result with metadata sources info
     result = {
         "formatted": f"{mood};{language};{industry};{genre}",
         "mood": mood,
         "language": language,
         "industry": industry,  # Enhanced with web search
         "genre": genre,
-        "metadata_sources": {
-            "musicbrainz_found": musicbrainz_data.get("found", False),
-            "wikipedia_checked": bool(wiki_data.get("industry_hints"))
+        "sources_used": {
+            "musicbrainz": musicbrainz_data.get("found", False),
+            "wikipedia": bool(wiki_data.get("industry_hints")),
+            "labels_found": len(musicbrainz_data.get("labels", [])),
+            "is_soundtrack": wiki_data.get("is_film_album", False)
         }
     }
     
