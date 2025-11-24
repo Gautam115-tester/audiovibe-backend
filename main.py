@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os
 import json
+import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
@@ -11,7 +12,7 @@ from groq import Groq
 # 1. Load Environment Variables
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Backend API", version="5.1.0 (Safe-Startup)")
+app = FastAPI(title="AudioVibe Backend API", version="6.0.0 (Enhanced-Industry-Detection)")
 
 # 2. CORS
 app.add_middleware(
@@ -81,18 +82,199 @@ def ensure_ready():
     if not supabase or not groq_client:
         raise HTTPException(status_code=503, detail="Backend Not Ready: Clients not initialized")
 
-# 8. Endpoints
+# 8. NEW: MusicBrainz API Helper (Free, No API Key Required)
+def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> dict:
+    """
+    Search MusicBrainz for track metadata
+    Returns: dict with 'found', 'release_type', 'labels', 'tags'
+    """
+    try:
+        base_url = "https://musicbrainz.org/ws/2/recording/"
+        query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
+        if album and album.lower() != "unknown":
+            query_parts.append(f'release:"{album}"')
+        
+        query = " AND ".join(query_parts)
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": 3
+        }
+        headers = {"User-Agent": "AudioVibe/6.0 (contact@audiovibe.app)"}
+        
+        response = requests.get(base_url, params=params, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("recordings"):
+                recording = data["recordings"][0]
+                releases = recording.get("releases", [])
+                tags = [tag["name"] for tag in recording.get("tags", [])]
+                
+                labels = []
+                release_types = []
+                for release in releases[:3]:
+                    if "label-info" in release:
+                        labels.extend([li.get("label", {}).get("name") for li in release["label-info"]])
+                    release_types.append(release.get("status", ""))
+                
+                return {
+                    "found": True,
+                    "release_type": release_types[0] if release_types else "Unknown",
+                    "labels": list(set(labels))[:3],
+                    "tags": tags[:5]
+                }
+    except Exception as e:
+        print(f"MusicBrainz error: {e}")
+    
+    return {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
+
+# 9. NEW: Wikipedia/Wikidata Helper (Fallback)
+def search_wikipedia(artist: str, album: str) -> dict:
+    """
+    Search Wikipedia for album/movie information
+    Returns: dict with 'is_soundtrack', 'is_film_album', 'industry_hints'
+    """
+    try:
+        if not album or album.lower() == "unknown":
+            return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
+        
+        search_url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": f"{album} {artist} album soundtrack",
+            "format": "json",
+            "srlimit": 3
+        }
+        
+        response = requests.get(search_url, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("query", {}).get("search", [])
+            
+            for result in results:
+                snippet = result.get("snippet", "").lower()
+                title = result.get("title", "").lower()
+                
+                is_soundtrack = any(word in snippet or word in title 
+                                   for word in ["soundtrack", "film", "movie", "cinema"])
+                
+                industry_hints = []
+                if any(word in snippet or word in title 
+                      for word in ["bollywood", "hindi film", "mumbai"]):
+                    industry_hints.append("Bollywood")
+                if any(word in snippet or word in title 
+                      for word in ["tollywood", "telugu film", "tamil film", "kollywood"]):
+                    industry_hints.append("Tollywood")
+                if any(word in snippet or word in title 
+                      for word in ["punjabi music", "punjabi album"]):
+                    industry_hints.append("Punjabi")
+                
+                if is_soundtrack or industry_hints:
+                    return {
+                        "is_soundtrack": is_soundtrack,
+                        "is_film_album": is_soundtrack,
+                        "industry_hints": industry_hints
+                    }
+        
+    except Exception as e:
+        print(f"Wikipedia error: {e}")
+    
+    return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
+
+# 10. Enhanced Industry Detection
+def detect_industry_enhanced(artist: str, title: str, album: Optional[str], 
+                            musicbrainz_data: dict, wiki_data: dict) -> str:
+    """
+    Advanced industry detection combining multiple signals
+    """
+    artist_lower = artist.lower()
+    album_lower = album.lower() if album else ""
+    
+    # Check Wikipedia hints first (most reliable for film music)
+    if wiki_data.get("industry_hints"):
+        return wiki_data["industry_hints"][0]
+    
+    # Film/Soundtrack detection
+    is_film_music = (
+        wiki_data.get("is_soundtrack", False) or
+        any(word in album_lower for word in [
+            "soundtrack", "ost", "original score", "film", "movie", 
+            "cinema", "picture"
+        ])
+    )
+    
+    # Indian Film Industry Detection
+    bollywood_indicators = [
+        "bollywood", "hindi", "mumbai", "t-series", "zee music",
+        "sony music india", "yrf", "dharma", "eros", "tips"
+    ]
+    tollywood_indicators = [
+        "tollywood", "telugu", "tamil", "kollywood", "malayalam",
+        "lahari", "aditya music", "mango music", "saregama south"
+    ]
+    punjabi_indicators = [
+        "punjabi", "speed records", "white hill", "saga music"
+    ]
+    
+    # Check MusicBrainz labels
+    labels = " ".join(musicbrainz_data.get("labels", [])).lower()
+    tags = " ".join(musicbrainz_data.get("tags", [])).lower()
+    
+    combined_text = f"{artist_lower} {album_lower} {labels} {tags}"
+    
+    # Film music gets priority
+    if is_film_music:
+        if any(ind in combined_text for ind in bollywood_indicators):
+            return "Bollywood"
+        if any(ind in combined_text for ind in tollywood_indicators):
+            return "Tollywood"
+        if any(ind in combined_text for ind in punjabi_indicators):
+            return "Punjabi"
+    
+    # Non-film Indian music
+    if any(ind in combined_text for ind in bollywood_indicators):
+        # Check if it's independent artist
+        indie_labels = ["independent", "self-released", "indie", "unsigned"]
+        if any(label in labels for label in indie_labels):
+            return "Indie"
+        return "Bollywood"
+    
+    if any(ind in combined_text for ind in tollywood_indicators):
+        return "Tollywood"
+    
+    if any(ind in combined_text for ind in punjabi_indicators):
+        return "Punjabi"
+    
+    # Western/International detection
+    western_indicators = [
+        "atlantic", "columbia", "universal", "warner", "epic", "interscope",
+        "capitol", "rca", "def jam", "republic"
+    ]
+    if any(ind in labels for ind in western_indicators):
+        return "International"
+    
+    # Default to Indie for unknown/independent releases
+    if "independent" in labels or "self" in labels:
+        return "Indie"
+    
+    # Last resort: check language/region
+    indian_names = ["kumar", "singh", "sharma", "khan", "rao", "reddy", "iyer"]
+    if any(name in artist_lower for name in indian_names):
+        return "Indie"
+    
+    return "International"
+
+# 11. Endpoints
 @app.get("/")
 def read_root():
     if startup_error:
         return {"status": "Maintenance Mode", "error": startup_error}
-    return {"status": "Active", "version": "5.1.0"}
+    return {"status": "Active", "version": "6.0.0"}
 
 @app.get("/health")
 def health_check():
-    """
-    DEBUG ENDPOINT: Visit this to see why 'Login' or 'Internal' errors are happening.
-    """
     return {
         "status": "unhealthy" if startup_error else "healthy",
         "startup_error": startup_error,
@@ -117,7 +299,8 @@ async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(
     ensure_ready()
     try:
         data = track.dict()
-        if not data.get('tier_required'): data['tier_required'] = 'free'
+        if not data.get('tier_required'): 
+            data['tier_required'] = 'free'
         response = supabase.table("music_tracks").insert(data).execute()
         return {"status": "success", "data": response.data}
     except Exception as e:
@@ -129,8 +312,10 @@ async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(
     try:
         completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
         supabase.rpc('upsert_listening_stat', {
-            'p_user_id': stat.user_id, 'p_track_id': stat.track_id, 
-            'p_listen_time_ms': stat.listen_time_ms, 'p_completion_rate': completion_rate
+            'p_user_id': stat.user_id, 
+            'p_track_id': stat.track_id, 
+            'p_listen_time_ms': stat.listen_time_ms, 
+            'p_completion_rate': completion_rate
         }).execute()
         return {"status": "recorded"}
     except Exception:
@@ -144,95 +329,102 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
     clean_artist = song.artist.strip()
     clean_album = song.album.strip() if song.album else ""
     
-    cache_key = f"{clean_artist.lower()}:{clean_title.lower()}"
+    cache_key = f"{clean_artist.lower()}:{clean_title.lower()}:{clean_album.lower()}"
     if cache_key in metadata_cache:
+        print(f"💾 Cache hit: {cache_key}")
         return metadata_cache[cache_key]
 
+    print(f"🔍 Analyzing: '{clean_title}' by '{clean_artist}' from '{clean_album}'")
+    
+    # Step 1: Search external sources
+    musicbrainz_data = search_musicbrainz(clean_artist, clean_title, clean_album)
+    wiki_data = search_wikipedia(clean_artist, clean_album)
+    
+    print(f"📊 MusicBrainz: {musicbrainz_data}")
+    print(f"📖 Wikipedia: {wiki_data}")
+    
+    # Step 2: Enhanced industry detection
+    industry = detect_industry_enhanced(
+        clean_artist, clean_title, clean_album,
+        musicbrainz_data, wiki_data
+    )
+    
+    print(f"🏭 Detected Industry: {industry}")
+    
+    # Step 3: Build context for Groq
+    context_info = f"Artist: {clean_artist}, Title: {clean_title}"
     if clean_album and clean_album.lower() != "unknown":
-        search_query = f"Track: '{clean_title}' from Album/Movie: '{clean_album}' by Artist: '{clean_artist}'"
-    else:
-        search_query = f"Track: '{clean_title}' by Artist: '{clean_artist}'"
-
-    print(f"🔍 Analyzing: {search_query}")
-
-    # --- LAYMAN PROMPT ---
+        context_info += f", Album: {clean_album}"
+    
+    if musicbrainz_data.get("found"):
+        context_info += f", Labels: {', '.join(musicbrainz_data['labels'][:2])}"
+        context_info += f", Tags: {', '.join(musicbrainz_data['tags'][:3])}"
+    
+    if wiki_data.get("is_film_album"):
+        context_info += ", Type: Film Soundtrack"
+    
+    # Step 4: Groq Classification (Mood, Language, Genre)
     prompt = (
-        f"Analyze this music track: {search_query}.\n\n"
-        "TASK 1: MOOD (Verification Matrix)\n"
-        "   - High Energy + Angry/War -> 'Aggressive'\n"
-        "   - High Energy + Happy/Dance -> 'Energetic'\n"
-        "   - Low Energy + Love -> 'Romantic'\n"
-        "   - Low Energy + Sad -> 'Melancholic'\n"
-        "   - Spiritual -> 'Spiritual'\n\n"
+        f"Analyze: {context_info}\n"
+        f"Detected Industry: {industry}\n\n"
         
-        "TASK 2: INDUSTRY (Source)\n"
-        "   - India (Hindi) -> 'Bollywood'\n"
-        "   - India (South) -> 'Tollywood'\n"
-        "   - India (Punjab) -> 'Punjabi'\n"
-        "   - Western -> 'International'\n"
-        "   - Independent -> 'Indie'\n\n"
+        "TASK 1: MOOD\n"
+        "   Options: Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting\n\n"
         
-        "TASK 3: GENRE (SIMPLIFY FOR LAYMAN)\n"
-        "   - 'Party', 'Pop', 'Rock', 'Hip-Hop', 'Folk', 'Devotional', 'Classical', 'LoFi'\n\n"
+        "TASK 2: LANGUAGE\n"
+        "   Detect primary language (Hindi, Telugu, Tamil, Punjabi, English, etc.)\n\n"
         
-        "REQUIRED OUTPUT (JSON):\n"
+        "TASK 3: GENRE (Simple categories)\n"
+        "   Options: Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz\n\n"
+        
+        "OUTPUT JSON:\n"
         "{\n"
-        '  "mood": "One word from Task 1",\n'
-        '  "language": "Primary language",\n'
-        '  "industry": "One word from Task 2",\n'
-        '  "genre": "One word from Task 3",\n'
-        '  "reasoning": "Brief explanation"\n'
+        '  "mood": "...",\n'
+        '  "language": "...",\n'
+        '  "genre": "..."\n'
         "}"
     )
 
     try:
         chat_completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a music classifier. Output strict JSON."},
+                {"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
                 {"role": "user", "content": prompt}
             ],
             model=GROQ_MODELS["primary"],
             temperature=0.1,
-            max_tokens=200,
+            max_tokens=150,
             response_format={"type": "json_object"}
         )
 
         content = chat_completion.choices[0].message.content.strip()
+        data = json.loads(content)
         
-        try:
-            data = json.loads(content)
-            mood = data.get("mood", "Neutral").title()
-            language = data.get("language", "Unknown").title()
-            industry = data.get("industry", "International").title()
-            genre = data.get("genre", "Pop").title()
-            
-            reasoning = data.get("reasoning", "").lower()
-            if "fight" in reasoning or "war" in reasoning or "aggressive" in reasoning:
-                if mood == "Romantic": mood = "Aggressive"
-
-        except json.JSONDecodeError:
-            mood, language, industry, genre = "Neutral", "Unknown", "International", "Pop"
-
-        result = {
-            "formatted": f"{mood};{language};{industry};{genre}",
-            "mood": mood,
-            "language": language,
-            "industry": industry,
-            "genre": genre
-        }
-        
-        metadata_cache[cache_key] = result
-        return result
+        mood = data.get("mood", "Neutral").title()
+        language = data.get("language", "Unknown").title()
+        genre = data.get("genre", "Pop").title()
 
     except Exception as e:
-        print(f"Error: {e}")
-        return {
-            "formatted": "Neutral;Unknown;International;Pop",
-            "mood": "Neutral",
-            "language": "Unknown",
-            "industry": "International",
-            "genre": "Pop"
+        print(f"⚠️ Groq error: {e}")
+        mood, language, genre = "Neutral", "Unknown", "Pop"
+
+    # Final result
+    result = {
+        "formatted": f"{mood};{language};{industry};{genre}",
+        "mood": mood,
+        "language": language,
+        "industry": industry,  # Enhanced with web search
+        "genre": genre,
+        "metadata_sources": {
+            "musicbrainz_found": musicbrainz_data.get("found", False),
+            "wikipedia_checked": bool(wiki_data.get("industry_hints"))
         }
+    }
+    
+    metadata_cache[cache_key] = result
+    print(f"✅ Result: {result['formatted']}")
+    
+    return result
 
 if __name__ == "__main__":
     import uvicorn
