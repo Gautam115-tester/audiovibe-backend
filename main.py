@@ -8,10 +8,10 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
 
-# 1. Load Env
+# 1. Load Environment Variables
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Backend API", version="5.0.0 (Layman Genres)")
+app = FastAPI(title="AudioVibe Backend API", version="5.1.0 (Safe-Startup)")
 
 # 2. CORS
 app.add_middleware(
@@ -22,27 +22,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Auth
+# 3. Global State for Clients
+supabase: Optional[Client] = None
+groq_client: Optional[Groq] = None
+startup_error: Optional[str] = None
+
+# 4. Safe Initialization (Prevents Crash on Boot)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GROQ_API_KEY:
-    raise RuntimeError("CRITICAL: Missing Keys")
-
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    groq_client = Groq(api_key=GROQ_API_KEY)
-except Exception as e:
-    print(f"Init Failed: {e}")
-    raise
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase Credentials Missing in Environment Variables")
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY Missing in Environment Variables")
 
-# 4. Config
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    print("✅ System Online: Clients Initialized")
+
+except Exception as e:
+    startup_error = str(e)
+    print(f"❌ Startup Warning: {e}")
+    print("Server will start in Maintenance Mode (Health Check Only).")
+
+# 5. Config
 EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
 GROQ_MODELS = {"primary": "llama-3.3-70b-versatile"}
 metadata_cache = {}
 
-# 5. Models
+# 6. Models
 class SongRequest(BaseModel):
     artist: str
     title: str
@@ -64,13 +74,38 @@ class PlayRecord(BaseModel):
     listen_time_ms: int
     total_duration_ms: int
 
-# 6. Standard Endpoints
+# 7. Helper: Check Backend Readiness
+def ensure_ready():
+    if startup_error:
+        raise HTTPException(status_code=503, detail=f"Backend Not Ready: {startup_error}")
+    if not supabase or not groq_client:
+        raise HTTPException(status_code=503, detail="Backend Not Ready: Clients not initialized")
+
+# 8. Endpoints
 @app.get("/")
 def read_root():
-    return {"status": "Active", "version": "5.0.0"}
+    if startup_error:
+        return {"status": "Maintenance Mode", "error": startup_error}
+    return {"status": "Active", "version": "5.1.0"}
+
+@app.get("/health")
+def health_check():
+    """
+    DEBUG ENDPOINT: Visit this to see why 'Login' or 'Internal' errors are happening.
+    """
+    return {
+        "status": "unhealthy" if startup_error else "healthy",
+        "startup_error": startup_error,
+        "env_vars": {
+            "GROQ_KEY_SET": bool(GROQ_API_KEY),
+            "SUPABASE_URL_SET": bool(SUPABASE_URL),
+            "SUPABASE_KEY_SET": bool(SUPABASE_SERVICE_ROLE_KEY)
+        }
+    }
 
 @app.get("/tracks")
 async def get_tracks(x_app_integrity: Optional[str] = Header(None)):
+    ensure_ready()
     try:
         response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
         return response.data
@@ -79,6 +114,7 @@ async def get_tracks(x_app_integrity: Optional[str] = Header(None)):
 
 @app.post("/tracks")
 async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(None)):
+    ensure_ready()
     try:
         data = track.dict()
         if not data.get('tier_required'): data['tier_required'] = 'free'
@@ -89,6 +125,7 @@ async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(
 
 @app.post("/record-play")
 async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(None)):
+    ensure_ready()
     try:
         completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
         supabase.rpc('upsert_listening_stat', {
@@ -99,9 +136,10 @@ async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(
     except Exception:
         return {"status": "error"}
 
-# 7. ENRICH METADATA (Simplified for Layman)
 @app.post("/enrich-metadata")
 async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = Header(None)):
+    ensure_ready()
+    
     clean_title = song.title.strip()
     clean_artist = song.artist.strip()
     clean_album = song.album.strip() if song.album else ""
@@ -117,7 +155,7 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
 
     print(f"🔍 Analyzing: {search_query}")
 
-    # --- SIMPLIFIED LAYMAN PROMPT ---
+    # --- LAYMAN PROMPT ---
     prompt = (
         f"Analyze this music track: {search_query}.\n\n"
         "TASK 1: MOOD (Verification Matrix)\n"
@@ -135,22 +173,14 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
         "   - Independent -> 'Indie'\n\n"
         
         "TASK 3: GENRE (SIMPLIFY FOR LAYMAN)\n"
-        "   Map the specific style to ONE of these simple categories ONLY:\n"
-        "   - 'Party' (Use for: EDM, House, Item Songs, Mass Beats, Club, Disco)\n"
-        "   - 'Pop' (Use for: General Hits, Filmy, Easy Listening)\n"
-        "   - 'Rock' (Use for: Metal, Alternative, Heavy Guitar)\n"
-        "   - 'Hip-Hop' (Use for: Rap, Trap, Drill, R&B)\n"
-        "   - 'Folk' (Use for: Traditional, Village, Acoustic, Desi)\n"
-        "   - 'Devotional' (Use for: Sufi, Bhajan, Gospel, Qawwali)\n"
-        "   - 'Classical' (Use for: Orchestra, Sitar, Ragas)\n"
-        "   - 'LoFi' (Use for: Slow, Chill, Study)\n\n"
+        "   - 'Party', 'Pop', 'Rock', 'Hip-Hop', 'Folk', 'Devotional', 'Classical', 'LoFi'\n\n"
         
         "REQUIRED OUTPUT (JSON):\n"
         "{\n"
         '  "mood": "One word from Task 1",\n'
         '  "language": "Primary language",\n'
         '  "industry": "One word from Task 2",\n'
-        '  "genre": "One word from Task 3 (The Simple Category)",\n'
+        '  "genre": "One word from Task 3",\n'
         '  "reasoning": "Brief explanation"\n'
         "}"
     )
@@ -158,7 +188,7 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
     try:
         chat_completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a music classifier for everyday users. You simplify complex genres into basic categories."},
+                {"role": "system", "content": "You are a music classifier. Output strict JSON."},
                 {"role": "user", "content": prompt}
             ],
             model=GROQ_MODELS["primary"],
@@ -176,7 +206,6 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
             industry = data.get("industry", "International").title()
             genre = data.get("genre", "Pop").title()
             
-            # Safety Check for Mood
             reasoning = data.get("reasoning", "").lower()
             if "fight" in reasoning or "war" in reasoning or "aggressive" in reasoning:
                 if mood == "Romantic": mood = "Aggressive"
