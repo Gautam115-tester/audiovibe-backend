@@ -180,8 +180,9 @@ class TrackUpload(BaseModel):
     cover_image_url: Optional[str] = None
     duration_ms: int = Field(..., ge=0)
     genres: List[str] = Field(default_factory=list)
+    # ✅ FIX: Added 'pro' and 'ultra_pro' to valid tiers
     # ✅ FIX: Changed 'regex' to 'pattern' for Pydantic V2
-    tier_required: str = Field(default="free", pattern="^(free|premium)$")
+    tier_required: str = Field(default="free", pattern="^(free|pro|ultra_pro)$")
 
 class PlayRecord(BaseModel):
     user_id: str = Field(..., min_length=1)
