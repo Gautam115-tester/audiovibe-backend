@@ -460,22 +460,56 @@ async def detailed_health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+# UPDATE THIS ENDPOINT
 @app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_TRACKS)
-async def get_tracks_metadata(request: Request):
-    """Get tracks metadata (no audio URLs)"""
+async def get_tracks_metadata(
+    request: Request,
+    page: int = 1,      # Default to page 1
+    limit: int = 20,    # Default to 20 items per page
+    search: Optional[str] = None  # Optional search query
+):
+    """
+    Get tracks metadata with Pagination & Search.
+    SCALABLE FOR 1 MILLION+ SONGS.
+    """
     ensure_ready()
     
     try:
-        response = state.supabase.table("music_tracks").select(
-            "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
-        ).order("created_at", desc=True).execute()
+        # 1. Calculate Pagination Range
+        # Supabase uses 0-based indexing for range
+        start = (page - 1) * limit
+        end = start + limit - 1
+        
+        # 2. Build Query
+        # We ask for the "exact" count of total rows to help frontend pagination
+        query = state.supabase.table("music_tracks").select(
+            "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at",
+            count="exact"
+        )
+        
+        # 3. Server-Side Search (Crucial for large DBs)
+        if search and search.strip():
+            search_term = f"%{search.strip()}%"
+            # Search across title, artist, and album using ILIKE (case-insensitive)
+            query = query.or_(f"title.ilike.{search_term},artist.ilike.{search_term},album.ilike.{search_term}")
+            
+        # 4. Apply Pagination & Sort
+        # Sort by creation date (newest first)
+        query = query.order("created_at", desc=True).range(start, end)
+        
+        # 5. Execute
+        response = query.execute()
         
         return {
             "status": "success",
-            "count": len(response.data),
+            "page": page,
+            "limit": limit,
+            "total_count": response.count, # Total songs matching query (e.g., 5000)
+            "count": len(response.data),   # Songs in this response (e.g., 20)
             "tracks": response.data
         }
+        
     except Exception as e:
         logger.error(f"Error fetching tracks: {e}")
         raise HTTPException(
