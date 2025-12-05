@@ -429,6 +429,25 @@ def detect_industry_enhanced(
 # ENDPOINTS
 # ============================================================================
 
+@app.get("/")
+async def root():
+    """Root endpoint - API information"""
+    return {
+        "name": "AudioVibe Secure API",
+        "version": "10.0.0",
+        "status": "online",
+        "documentation": "/docs",
+        "health_check": "/health",
+        "endpoints": {
+            "metadata": "GET /tracks/metadata",
+            "stream": "GET /tracks/stream/{track_id}",
+            "add_track": "POST /tracks",
+            "record_play": "POST /record-play",
+            "enrich_metadata": "POST /enrich-metadata"
+        },
+        "note": "All endpoints except /health require X-App-Integrity and X-App-Timestamp headers"
+    }
+
 @app.get("/health")
 async def health_check():
     """Basic health check endpoint"""
@@ -479,6 +498,32 @@ async def detailed_health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+@app.get("/debug/tracks")
+async def debug_tracks(limit: int = 10):
+    """
+    Debug endpoint to test track fetching without authentication.
+    Remove this in production!
+    """
+    ensure_ready()
+    try:
+        response = state.supabase.table("music_tracks").select(
+            "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required"
+        ).limit(limit).execute()
+        
+        return {
+            "status": "success",
+            "count": len(response.data),
+            "tracks": response.data,
+            "note": "This is a debug endpoint - remove in production"
+        }
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": str(e.__traceback__)
+        }
+
 @app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_TRACKS)
 async def get_tracks_metadata(
@@ -505,73 +550,77 @@ async def get_tracks_metadata(
     """
     ensure_ready()
     
-    # Validate and cap limit
-    limit = min(limit, config.MAX_PAGE_SIZE)
+    # Validate and cap parameters
+    try:
+        page = max(1, int(page))  # Ensure page is at least 1
+        limit = min(max(1, int(limit)), config.MAX_PAGE_SIZE)  # Between 1 and MAX
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid page or limit parameter"
+        )
     
     try:
         # Calculate pagination range
         start = (page - 1) * limit
         end = start + limit - 1
         
-        # STEP 1: Fetch distinct albums (using the unique_albums view)
-        album_query = state.supabase.table("unique_albums").select(
-            "album, artist",
-            count="exact"
-        )
-        
-        # Apply search filter if provided
-        if search and search.strip():
-            search_term = f"%{search.strip()}%"
-            album_query = album_query.or_(
-                f"album.ilike.{search_term},artist.ilike.{search_term}"
+        # Try album-based pagination first
+        try:
+            # STEP 1: Fetch distinct albums (using the unique_albums view)
+            album_query = state.supabase.table("unique_albums").select(
+                "album, artist",
+                count="exact"
             )
-        
-        # Apply pagination and ordering
-        album_query = album_query.order("created_at", desc=True).range(start, end)
-        albums_response = album_query.execute()
-        
-        # If no albums found, return empty result
-        if not albums_response.data:
+            
+            # Apply search filter if provided
+            if search and search.strip():
+                search_term = f"%{search.strip()}%"
+                album_query = album_query.or_(
+                    f"album.ilike.{search_term},artist.ilike.{search_term}"
+                )
+            
+            # Apply pagination and ordering
+            album_query = album_query.order("created_at", desc=True).range(start, end)
+            albums_response = album_query.execute()
+            
+            # If no albums found, return empty result
+            if not albums_response.data:
+                return {
+                    "status": "success",
+                    "page": page,
+                    "limit": limit,
+                    "total_albums": 0,
+                    "total_tracks": 0,
+                    "albums_in_page": 0,
+                    "tracks": []
+                }
+            
+            # Extract album names
+            album_names = [album['album'] for album in albums_response.data]
+            
+            # STEP 2: Fetch ALL tracks for these albums
+            tracks_query = state.supabase.table("music_tracks").select(
+                "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
+            ).in_("album", album_names).order("created_at", desc=True)
+            
+            tracks_response = tracks_query.execute()
+            
             return {
                 "status": "success",
                 "page": page,
                 "limit": limit,
-                "total_albums": 0,
-                "total_tracks": 0,
-                "albums_in_page": 0,
-                "tracks": []
+                "total_albums": albums_response.count,
+                "total_tracks": len(tracks_response.data),
+                "albums_in_page": len(album_names),
+                "tracks": tracks_response.data
             }
-        
-        # Extract album names
-        album_names = [album['album'] for album in albums_response.data]
-        
-        # STEP 2: Fetch ALL tracks for these albums
-        # This ensures complete albums are never split across pages
-        tracks_query = state.supabase.table("music_tracks").select(
-            "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
-        ).in_("album", album_names).order("created_at", desc=True)
-        
-        tracks_response = tracks_query.execute()
-        
-        return {
-            "status": "success",
-            "page": page,
-            "limit": limit,
-            "total_albums": albums_response.count,  # Total albums matching criteria
-            "total_tracks": len(tracks_response.data),  # Total tracks in this response
-            "albums_in_page": len(album_names),  # Number of albums in this page
-            "tracks": tracks_response.data
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching tracks metadata: {e}")
-        
-        # Fallback to standard track pagination if album view fails
-        try:
-            logger.warning("Falling back to standard track pagination...")
-            start = (page - 1) * limit
-            end = start + limit - 1
             
+        except Exception as view_error:
+            # Fallback to standard track pagination if album view fails
+            logger.warning(f"Album-based pagination failed, using fallback: {view_error}")
+            
+            # Standard pagination fallback
             fallback_query = state.supabase.table("music_tracks").select(
                 "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at",
                 count="exact"
@@ -593,14 +642,15 @@ async def get_tracks_metadata(
                 "total_count": fallback_response.count,
                 "count": len(fallback_response.data),
                 "tracks": fallback_response.data,
-                "fallback_mode": True
+                "mode": "standard_pagination"
             }
-        except Exception as fallback_error:
-            logger.error(f"Fallback also failed: {fallback_error}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to fetch tracks"
-            )
+        
+    except Exception as e:
+        logger.error(f"Error fetching tracks metadata: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch tracks: {str(e)}"
+        )
 
 @app.get("/tracks/stream/{track_id}", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_STREAM)
