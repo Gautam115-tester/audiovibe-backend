@@ -181,11 +181,13 @@ class SongRequest(BaseModel):
         """Remove leading/trailing whitespace"""
         return v.strip() if v else v
 
+# ✅ MODIFIED MODEL TO FIX 422 ERROR
 class TrackUpload(BaseModel):
     """Request model for uploading new tracks"""
     title: str = Field(..., min_length=1, max_length=200)
     artist: str = Field(..., min_length=1, max_length=200)
-    album: str = Field(..., max_length=200)
+    # 👇 CHANGE THIS LINE: Make album optional with a default value
+    album: Optional[str] = Field("Unknown Album", max_length=200) 
     audio_file_url: str = Field(..., min_length=1)
     cover_image_url: Optional[str] = None
     duration_ms: int = Field(..., ge=0)
