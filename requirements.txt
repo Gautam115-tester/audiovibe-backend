@@ -1,8 +1,9 @@
 fastapi
-uvicorn[standard]
-httpx
+uvicorn
 pydantic
 python-dotenv
 supabase
 groq
-requests
+slowapi
+redis
+httpx
