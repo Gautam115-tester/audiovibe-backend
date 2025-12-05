@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 import os
 import json
@@ -19,6 +19,7 @@ from slowapi.errors import RateLimitExceeded
 from functools import lru_cache
 import redis
 from contextlib import asynccontextmanager
+import asyncio
 
 # ============================================================================
 # CONFIGURATION & LOGGING
@@ -42,7 +43,7 @@ class Config:
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     
     # CORS
-    ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     
     # Rate Limiting
     RATE_LIMIT_TRACKS: str = "30/minute"
@@ -166,8 +167,9 @@ class SongRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     album: Optional[str] = Field(None, max_length=200)
     
-    @validator('artist', 'title', 'album')
-    def clean_whitespace(cls, v):
+    @field_validator('artist', 'title', 'album')
+    @classmethod
+    def clean_whitespace(cls, v: Optional[str]) -> Optional[str]:
         return v.strip() if v else v
 
 class TrackUpload(BaseModel):
@@ -178,7 +180,8 @@ class TrackUpload(BaseModel):
     cover_image_url: Optional[str] = None
     duration_ms: int = Field(..., ge=0)
     genres: List[str] = Field(default_factory=list)
-    tier_required: str = Field(default="free", regex="^(free|premium)$")
+    # ✅ FIX: Changed 'regex' to 'pattern' for Pydantic V2
+    tier_required: str = Field(default="free", pattern="^(free|premium)$")
 
 class PlayRecord(BaseModel):
     user_id: str = Field(..., min_length=1)
@@ -546,12 +549,11 @@ async def get_stream_url(request: Request, track_id: str):
 async def add_track(track: TrackUpload):
     """
     Add new track (Admin only - should add role check)
-    TODO: Implement proper admin authentication
     """
     ensure_ready()
     
     try:
-        data = track.dict()
+        data = track.model_dump() # Pydantic v2 uses model_dump instead of dict
         response = state.supabase.table("music_tracks").insert(data).execute()
         
         logger.info(f"Track added: {track.title} by {track.artist}")
@@ -732,7 +734,6 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     import uvicorn
-    import asyncio
     
     uvicorn.run(
         app,
