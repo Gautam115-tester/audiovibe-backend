@@ -1,122 +1,317 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Dict, Any
 import os
 import json
-import requests
+import httpx
+import hashlib
+import time
+import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from functools import lru_cache
+import redis
+from contextlib import asynccontextmanager
 
-# 1. Load Environment Variables
+# ============================================================================
+# CONFIGURATION & LOGGING
+# ============================================================================
+
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Backend API", version="6.0.0 (Enhanced-Industry-Detection)")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# 2. CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Configuration Class
+class Config:
+    # API Keys
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "change_this_secret")
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+    
+    # CORS
+    ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    
+    # Rate Limiting
+    RATE_LIMIT_TRACKS: str = "30/minute"
+    RATE_LIMIT_STREAM: str = "20/minute"
+    RATE_LIMIT_ENRICH: str = "10/minute"
+    
+    # Timeouts (seconds)
+    EXTERNAL_API_TIMEOUT: int = 5
+    REQUEST_TIMEOUT: int = 30
+    
+    # Cache TTL (seconds)
+    METADATA_CACHE_TTL: int = 3600  # 1 hour
+    
+    # Stream Expiration
+    SHORT_STREAM_EXPIRY: int = 480   # 8 minutes
+    LONG_STREAM_EXPIRY: int = 5400   # 90 minutes
+    LONG_TRACK_THRESHOLD: int = 900000  # 15 minutes in ms
+    
+    # Integrity Check
+    INTEGRITY_WINDOW: int = 30  # seconds
+    
+    # Models
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+
+config = Config()
+
+# ============================================================================
+# LIFESPAN & GLOBAL STATE
+# ============================================================================
+
+class AppState:
+    supabase: Optional[Client] = None
+    redis_client: Optional[redis.Redis] = None
+    http_client: Optional[httpx.AsyncClient] = None
+    groq_client: Optional[Groq] = None
+
+state = AppState()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup
+    logger.info("🚀 Starting AudioVibe API...")
+    
+    try:
+        # Initialize Supabase
+        if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError("Supabase credentials missing")
+        state.supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+        
+        # Initialize Groq
+        if not config.GROQ_API_KEY:
+            raise RuntimeError("GROQ_API_KEY missing")
+        state.groq_client = Groq(api_key=config.GROQ_API_KEY)
+        
+        # Initialize Redis (optional)
+        try:
+            state.redis_client = redis.from_url(
+                config.REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=5
+            )
+            state.redis_client.ping()
+            logger.info("✅ Redis connected")
+        except Exception as e:
+            logger.warning(f"⚠️  Redis unavailable, using in-memory cache: {e}")
+            state.redis_client = None
+        
+        # Initialize HTTP Client with connection pooling
+        state.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.EXTERNAL_API_TIMEOUT),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        )
+        
+        logger.info("✅ All services initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Startup failed: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("👋 Shutting down...")
+    if state.http_client:
+        await state.http_client.aclose()
+    if state.redis_client:
+        state.redis_client.close()
+
+# ============================================================================
+# APP INITIALIZATION
+# ============================================================================
+
+limiter = Limiter(key_func=get_remote_address)
+
+app = FastAPI(
+    title="AudioVibe Secure API",
+    version="9.0.0",
+    lifespan=lifespan
 )
 
-# 3. Global State for Clients
-supabase: Optional[Client] = None
-groq_client: Optional[Groq] = None
-startup_error: Optional[str] = None
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# 4. Safe Initialization (Prevents Crash on Boot)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+# CORS with proper configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+    max_age=3600,
+)
 
-try:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Supabase Credentials Missing in Environment Variables")
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY Missing in Environment Variables")
+# ============================================================================
+# MODELS
+# ============================================================================
 
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    print("✅ System Online: Clients Initialized")
-
-except Exception as e:
-    startup_error = str(e)
-    print(f"❌ Startup Warning: {e}")
-    print("Server will start in Maintenance Mode (Health Check Only).")
-
-# 5. Config
-EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
-GROQ_MODELS = {"primary": "llama-3.3-70b-versatile"}
-metadata_cache = {}
-
-# 6. Models
 class SongRequest(BaseModel):
-    artist: str
-    title: str
-    album: Optional[str] = None
+    artist: str = Field(..., min_length=1, max_length=200)
+    title: str = Field(..., min_length=1, max_length=200)
+    album: Optional[str] = Field(None, max_length=200)
+    
+    @validator('artist', 'title', 'album')
+    def clean_whitespace(cls, v):
+        return v.strip() if v else v
 
 class TrackUpload(BaseModel):
-    title: str
-    artist: str
-    album: str
-    audio_file_url: str
+    title: str = Field(..., min_length=1, max_length=200)
+    artist: str = Field(..., min_length=1, max_length=200)
+    album: str = Field(..., max_length=200)
+    audio_file_url: str = Field(..., min_length=1)
     cover_image_url: Optional[str] = None
-    duration_ms: int
-    genres: List[str]
-    tier_required: str = "free"
+    duration_ms: int = Field(..., ge=0)
+    genres: List[str] = Field(default_factory=list)
+    tier_required: str = Field(default="free", regex="^(free|premium)$")
 
 class PlayRecord(BaseModel):
-    user_id: str
-    track_id: str
-    listen_time_ms: int
-    total_duration_ms: int
+    user_id: str = Field(..., min_length=1)
+    track_id: str = Field(..., min_length=1)
+    listen_time_ms: int = Field(..., ge=0)
+    total_duration_ms: int = Field(..., gt=0)
 
-# 7. Helper: Check Backend Readiness
+# ============================================================================
+# SECURITY DEPENDENCIES
+# ============================================================================
+
+def verify_app_integrity(
+    x_app_integrity: str = Header(..., description="SHA256 hash for integrity"),
+    x_app_timestamp: str = Header(..., description="Unix timestamp")
+) -> Dict[str, Any]:
+    """Verify request integrity and prevent replay attacks"""
+    try:
+        request_time = int(x_app_timestamp)
+        current_time = int(time.time())
+        
+        # Check timestamp freshness
+        if abs(current_time - request_time) > config.INTEGRITY_WINDOW:
+            logger.warning(f"Expired request: timestamp={request_time}, current={current_time}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Request expired"
+            )
+        
+        # Verify integrity hash
+        expected_hash = hashlib.sha256(
+            f"{config.APP_SECRET}{x_app_timestamp}".encode()
+        ).hexdigest()
+        
+        if x_app_integrity != expected_hash:
+            logger.warning("Integrity check failed")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Integrity verification failed"
+            )
+        
+        return {"timestamp": request_time, "verified": True}
+        
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid timestamp format"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Integrity check error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Security verification failed"
+        )
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 def ensure_ready():
-    if startup_error:
-        raise HTTPException(status_code=503, detail=f"Backend Not Ready: {startup_error}")
-    if not supabase or not groq_client:
-        raise HTTPException(status_code=503, detail="Backend Not Ready: Clients not initialized")
+    """Verify all critical services are available"""
+    if not state.supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service unavailable"
+        )
+    if not state.groq_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI service unavailable"
+        )
 
-# 8. NEW: MusicBrainz API Helper (Free, No API Key Required)
-def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> dict:
-    """
-    Search MusicBrainz for track metadata
-    Returns: dict with 'found', 'release_type', 'labels', 'tags'
-    """
+async def get_cached_metadata(key: str) -> Optional[Dict]:
+    """Get metadata from Redis or memory"""
+    if state.redis_client:
+        try:
+            data = state.redis_client.get(f"metadata:{key}")
+            return json.loads(data) if data else None
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+    return None
+
+async def set_cached_metadata(key: str, value: Dict) -> None:
+    """Set metadata in Redis with TTL"""
+    if state.redis_client:
+        try:
+            state.redis_client.setex(
+                f"metadata:{key}",
+                config.METADATA_CACHE_TTL,
+                json.dumps(value)
+            )
+        except Exception as e:
+            logger.error(f"Redis set error: {e}")
+
+async def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> Dict:
+    """Search MusicBrainz API asynchronously"""
     try:
         base_url = "https://musicbrainz.org/ws/2/recording/"
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
-        if album and album.lower() != "unknown":
+        
+        if album and album.lower() not in ["unknown", ""]:
             query_parts.append(f'release:"{album}"')
         
         query = " AND ".join(query_parts)
-        params = {
-            "query": query,
-            "fmt": "json",
-            "limit": 3
-        }
-        headers = {"User-Agent": "AudioVibe/6.0 (contact@audiovibe.app)"}
+        params = {"query": query, "fmt": "json", "limit": 3}
+        headers = {"User-Agent": "AudioVibe/9.0 (contact@audiovibe.app)"}
         
-        response = requests.get(base_url, params=params, headers=headers, timeout=5)
+        response = await state.http_client.get(
+            base_url,
+            params=params,
+            headers=headers
+        )
         
         if response.status_code == 200:
             data = response.json()
-            if data.get("recordings"):
-                recording = data["recordings"][0]
+            if recordings := data.get("recordings"):
+                recording = recordings[0]
                 releases = recording.get("releases", [])
                 tags = [tag["name"] for tag in recording.get("tags", [])]
                 
                 labels = []
                 release_types = []
+                
                 for release in releases[:3]:
-                    if "label-info" in release:
-                        labels.extend([li.get("label", {}).get("name") for li in release["label-info"]])
-                    release_types.append(release.get("status", ""))
+                    if label_info := release.get("label-info"):
+                        labels.extend([
+                            li.get("label", {}).get("name")
+                            for li in label_info
+                            if li.get("label", {}).get("name")
+                        ])
+                    if rel_type := release.get("status"):
+                        release_types.append(rel_type)
                 
                 return {
                     "found": True,
@@ -124,19 +319,17 @@ def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> 
                     "labels": list(set(labels))[:3],
                     "tags": tags[:5]
                 }
+    except httpx.TimeoutException:
+        logger.warning("MusicBrainz API timeout")
     except Exception as e:
-        print(f"MusicBrainz error: {e}")
+        logger.error(f"MusicBrainz error: {e}")
     
     return {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
 
-# 9. NEW: Wikipedia/Wikidata Helper (Fallback)
-def search_wikipedia(artist: str, album: str) -> dict:
-    """
-    Search Wikipedia for album/movie information
-    Returns: dict with 'is_soundtrack', 'is_film_album', 'industry_hints'
-    """
+async def search_wikipedia(artist: str, album: str) -> Dict:
+    """Search Wikipedia API asynchronously"""
     try:
-        if not album or album.lower() == "unknown":
+        if not album or album.lower() in ["unknown", ""]:
             return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
         
         search_url = "https://en.wikipedia.org/w/api.php"
@@ -148,7 +341,8 @@ def search_wikipedia(artist: str, album: str) -> dict:
             "srlimit": 3
         }
         
-        response = requests.get(search_url, params=params, timeout=5)
+        response = await state.http_client.get(search_url, params=params)
+        
         if response.status_code == 200:
             data = response.json()
             results = data.get("query", {}).get("search", [])
@@ -156,19 +350,19 @@ def search_wikipedia(artist: str, album: str) -> dict:
             for result in results:
                 snippet = result.get("snippet", "").lower()
                 title = result.get("title", "").lower()
+                combined = f"{snippet} {title}"
                 
-                is_soundtrack = any(word in snippet or word in title 
-                                   for word in ["soundtrack", "film", "movie", "cinema"])
+                is_soundtrack = any(
+                    word in combined
+                    for word in ["soundtrack", "film", "movie", "cinema"]
+                )
                 
                 industry_hints = []
-                if any(word in snippet or word in title 
-                      for word in ["bollywood", "hindi film", "mumbai"]):
+                if any(word in combined for word in ["bollywood", "hindi film", "mumbai"]):
                     industry_hints.append("Bollywood")
-                if any(word in snippet or word in title 
-                      for word in ["tollywood", "telugu film", "tamil film", "kollywood"]):
+                if any(word in combined for word in ["tollywood", "telugu film", "tamil film"]):
                     industry_hints.append("Tollywood")
-                if any(word in snippet or word in title 
-                      for word in ["punjabi music", "punjabi album"]):
+                if any(word in combined for word in ["punjabi music", "punjabi album"]):
                     industry_hints.append("Punjabi")
                 
                 if is_soundtrack or industry_hints:
@@ -177,255 +371,373 @@ def search_wikipedia(artist: str, album: str) -> dict:
                         "is_film_album": is_soundtrack,
                         "industry_hints": industry_hints
                     }
-        
+    except httpx.TimeoutException:
+        logger.warning("Wikipedia API timeout")
     except Exception as e:
-        print(f"Wikipedia error: {e}")
+        logger.error(f"Wikipedia error: {e}")
     
     return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
 
-# 10. Enhanced Industry Detection
-def detect_industry_enhanced(artist: str, title: str, album: Optional[str], 
-                            musicbrainz_data: dict, wiki_data: dict) -> str:
-    """
-    Advanced industry detection combining multiple signals
-    """
+def detect_industry_enhanced(
+    artist: str,
+    title: str,
+    album: Optional[str],
+    musicbrainz_data: Dict,
+    wiki_data: Dict
+) -> str:
+    """Detect music industry with enhanced logic"""
+    if industry_hints := wiki_data.get("industry_hints"):
+        return industry_hints[0]
+    
     artist_lower = artist.lower()
     album_lower = album.lower() if album else ""
-    
-    # Check Wikipedia hints first (most reliable for film music)
-    if wiki_data.get("industry_hints"):
-        return wiki_data["industry_hints"][0]
-    
-    # Film/Soundtrack detection
-    is_film_music = (
-        wiki_data.get("is_soundtrack", False) or
-        any(word in album_lower for word in [
-            "soundtrack", "ost", "original score", "film", "movie", 
-            "cinema", "picture"
-        ])
-    )
-    
-    # Indian Film Industry Detection
-    bollywood_indicators = [
-        "bollywood", "hindi", "mumbai", "t-series", "zee music",
-        "sony music india", "yrf", "dharma", "eros", "tips"
-    ]
-    tollywood_indicators = [
-        "tollywood", "telugu", "tamil", "kollywood", "malayalam",
-        "lahari", "aditya music", "mango music", "saregama south"
-    ]
-    punjabi_indicators = [
-        "punjabi", "speed records", "white hill", "saga music"
-    ]
-    
-    # Check MusicBrainz labels
     labels = " ".join(musicbrainz_data.get("labels", [])).lower()
     tags = " ".join(musicbrainz_data.get("tags", [])).lower()
+    combined = f"{artist_lower} {album_lower} {labels} {tags}"
     
-    combined_text = f"{artist_lower} {album_lower} {labels} {tags}"
+    industry_keywords = {
+        "Bollywood": ["bollywood", "hindi", "mumbai"],
+        "Tollywood": ["tollywood", "telugu", "tamil"],
+        "Punjabi": ["punjabi"],
+    }
     
-    # Film music gets priority
-    if is_film_music:
-        if any(ind in combined_text for ind in bollywood_indicators):
-            return "Bollywood"
-        if any(ind in combined_text for ind in tollywood_indicators):
-            return "Tollywood"
-        if any(ind in combined_text for ind in punjabi_indicators):
-            return "Punjabi"
-    
-    # Non-film Indian music
-    if any(ind in combined_text for ind in bollywood_indicators):
-        # Check if it's independent artist
-        indie_labels = ["independent", "self-released", "indie", "unsigned"]
-        if any(label in labels for label in indie_labels):
-            return "Indie"
-        return "Bollywood"
-    
-    if any(ind in combined_text for ind in tollywood_indicators):
-        return "Tollywood"
-    
-    if any(ind in combined_text for ind in punjabi_indicators):
-        return "Punjabi"
-    
-    # Western/International detection
-    western_indicators = [
-        "atlantic", "columbia", "universal", "warner", "epic", "interscope",
-        "capitol", "rca", "def jam", "republic"
-    ]
-    if any(ind in labels for ind in western_indicators):
-        return "International"
-    
-    # Default to Indie for unknown/independent releases
-    if "independent" in labels or "self" in labels:
-        return "Indie"
-    
-    # Last resort: check language/region
-    indian_names = ["kumar", "singh", "sharma", "khan", "rao", "reddy", "iyer"]
-    if any(name in artist_lower for name in indian_names):
-        return "Indie"
+    for industry, keywords in industry_keywords.items():
+        if any(keyword in combined for keyword in keywords):
+            return industry
     
     return "International"
 
-# 11. Endpoints
-@app.get("/")
-def read_root():
-    if startup_error:
-        return {"status": "Maintenance Mode", "error": startup_error}
-    return {"status": "Active", "version": "6.0.0"}
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
 
 @app.get("/health")
-def health_check():
+async def health_check():
+    """Basic health check"""
     return {
-        "status": "unhealthy" if startup_error else "healthy",
-        "startup_error": startup_error,
-        "env_vars": {
-            "GROQ_KEY_SET": bool(GROQ_API_KEY),
-            "SUPABASE_URL_SET": bool(SUPABASE_URL),
-            "SUPABASE_KEY_SET": bool(SUPABASE_SERVICE_ROLE_KEY)
-        }
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "9.0.0"
     }
 
-@app.get("/tracks")
-async def get_tracks(x_app_integrity: Optional[str] = Header(None)):
-    ensure_ready()
+@app.get("/health/detailed")
+async def detailed_health_check():
+    """Detailed health check with service status"""
+    services = {
+        "database": False,
+        "redis": False,
+        "ai": False
+    }
+    
+    # Check Supabase
     try:
-        response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
-        return response.data
+        if state.supabase:
+            state.supabase.table("music_tracks").select("id").limit(1).execute()
+            services["database"] = True
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Database health check failed: {e}")
+    
+    # Check Redis
+    if state.redis_client:
+        try:
+            state.redis_client.ping()
+            services["redis"] = True
+        except Exception as e:
+            logger.error(f"Redis health check failed: {e}")
+    
+    # Check Groq
+    services["ai"] = state.groq_client is not None
+    
+    all_healthy = all(services.values()) or (services["database"] and services["ai"])
+    
+    return {
+        "status": "healthy" if all_healthy else "degraded",
+        "services": services,
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
-@app.post("/tracks")
-async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(None)):
+@app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
+@limiter.limit(config.RATE_LIMIT_TRACKS)
+async def get_tracks_metadata(request: Request):
+    """Get tracks metadata (no audio URLs)"""
     ensure_ready()
+    
     try:
-        data = track.dict()
-        if not data.get('tier_required'): 
-            data['tier_required'] = 'free'
-        response = supabase.table("music_tracks").insert(data).execute()
-        return {"status": "success", "data": response.data}
+        response = state.supabase.table("music_tracks").select(
+            "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
+        ).order("created_at", desc=True).execute()
+        
+        return {
+            "status": "success",
+            "count": len(response.data),
+            "tracks": response.data
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/record-play")
-async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(None)):
-    ensure_ready()
-    try:
-        completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
-        supabase.rpc('upsert_listening_stat', {
-            'p_user_id': stat.user_id, 
-            'p_track_id': stat.track_id, 
-            'p_listen_time_ms': stat.listen_time_ms, 
-            'p_completion_rate': completion_rate
-        }).execute()
-        return {"status": "recorded"}
-    except Exception:
-        return {"status": "error"}
-
-@app.post("/enrich-metadata")
-async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = Header(None)):
-    ensure_ready()
-    
-    clean_title = song.title.strip()
-    clean_artist = song.artist.strip()
-    clean_album = song.album.strip() if song.album else ""
-    
-    cache_key = f"{clean_artist.lower()}:{clean_title.lower()}:{clean_album.lower()}"
-    if cache_key in metadata_cache:
-        print(f"💾 Cache hit: {cache_key}")
-        return metadata_cache[cache_key]
-
-    print(f"🔍 Analyzing: '{clean_title}' by '{clean_artist}' from '{clean_album}'")
-    
-    # Step 1: Search external sources
-    musicbrainz_data = search_musicbrainz(clean_artist, clean_title, clean_album)
-    wiki_data = search_wikipedia(clean_artist, clean_album)
-    
-    print(f"📊 MusicBrainz: {musicbrainz_data}")
-    print(f"📖 Wikipedia: {wiki_data}")
-    
-    # Step 2: Enhanced industry detection
-    industry = detect_industry_enhanced(
-        clean_artist, clean_title, clean_album,
-        musicbrainz_data, wiki_data
-    )
-    
-    print(f"🏭 Detected Industry: {industry}")
-    
-    # Step 3: Build context for Groq
-    context_info = f"Artist: {clean_artist}, Title: {clean_title}"
-    if clean_album and clean_album.lower() != "unknown":
-        context_info += f", Album: {clean_album}"
-    
-    if musicbrainz_data.get("found"):
-        context_info += f", Labels: {', '.join(musicbrainz_data['labels'][:2])}"
-        context_info += f", Tags: {', '.join(musicbrainz_data['tags'][:3])}"
-    
-    if wiki_data.get("is_film_album"):
-        context_info += ", Type: Film Soundtrack"
-    
-    # Step 4: Groq Classification (Mood, Language, Genre)
-    prompt = (
-        f"Analyze: {context_info}\n"
-        f"Detected Industry: {industry}\n\n"
-        
-        "TASK 1: MOOD\n"
-        "   Options: Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting\n\n"
-        
-        "TASK 2: LANGUAGE\n"
-        "   Detect primary language (Hindi, Telugu, Tamil, Punjabi, English, etc.)\n\n"
-        
-        "TASK 3: GENRE (Simple categories)\n"
-        "   Options: Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz\n\n"
-        
-        "OUTPUT JSON:\n"
-        "{\n"
-        '  "mood": "...",\n'
-        '  "language": "...",\n'
-        '  "genre": "..."\n'
-        "}"
-    )
-
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            model=GROQ_MODELS["primary"],
-            temperature=0.1,
-            max_tokens=150,
-            response_format={"type": "json_object"}
+        logger.error(f"Error fetching tracks: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch tracks"
         )
 
-        content = chat_completion.choices[0].message.content.strip()
-        data = json.loads(content)
+@app.get("/tracks/stream/{track_id}", dependencies=[Depends(verify_app_integrity)])
+@limiter.limit(config.RATE_LIMIT_STREAM)
+async def get_stream_url(request: Request, track_id: str):
+    """Generate secure signed URL for streaming"""
+    ensure_ready()
+    
+    try:
+        # Fetch track details
+        response = state.supabase.table("music_tracks").select(
+            "audio_file_url, duration_ms, title"
+        ).eq("id", track_id).execute()
         
-        mood = data.get("mood", "Neutral").title()
-        language = data.get("language", "Unknown").title()
-        genre = data.get("genre", "Pop").title()
-
-    except Exception as e:
-        print(f"⚠️ Groq error: {e}")
-        mood, language, genre = "Neutral", "Unknown", "Pop"
-
-    # Final result
-    result = {
-        "formatted": f"{mood};{language};{industry};{genre}",
-        "mood": mood,
-        "language": language,
-        "industry": industry,  # Enhanced with web search
-        "genre": genre,
-        "metadata_sources": {
-            "musicbrainz_found": musicbrainz_data.get("found", False),
-            "wikipedia_checked": bool(wiki_data.get("industry_hints"))
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Track not found"
+            )
+        
+        track = response.data[0]
+        duration_ms = track.get('duration_ms', 0)
+        
+        # Dynamic expiration based on duration
+        is_long_content = (
+            not duration_ms or
+            duration_ms == 0 or
+            duration_ms > config.LONG_TRACK_THRESHOLD
+        )
+        
+        expires_in = (
+            config.LONG_STREAM_EXPIRY if is_long_content
+            else config.SHORT_STREAM_EXPIRY
+        )
+        
+        # Extract file path
+        raw_url = track['audio_file_url']
+        if "/music_files/" in raw_url:
+            file_path = raw_url.split("/music_files/")[1]
+        else:
+            file_path = raw_url
+        
+        # Generate signed URL
+        signed_response = state.supabase.storage.from_("music_files").create_signed_url(
+            file_path,
+            expires_in
+        )
+        
+        return {
+            "stream_url": signed_response["signedURL"],
+            "expires_in": expires_in,
+            "expires_at": int(time.time()) + expires_in,
+            "track_id": track_id,
+            "content_type": "series" if is_long_content else "music"
         }
-    }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Stream URL generation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate stream URL"
+        )
+
+@app.post("/tracks", dependencies=[Depends(verify_app_integrity)])
+async def add_track(track: TrackUpload):
+    """
+    Add new track (Admin only - should add role check)
+    TODO: Implement proper admin authentication
+    """
+    ensure_ready()
     
-    metadata_cache[cache_key] = result
-    print(f"✅ Result: {result['formatted']}")
+    try:
+        data = track.dict()
+        response = state.supabase.table("music_tracks").insert(data).execute()
+        
+        logger.info(f"Track added: {track.title} by {track.artist}")
+        
+        return {
+            "status": "success",
+            "message": "Track added successfully",
+            "data": response.data[0] if response.data else None
+        }
+    except Exception as e:
+        logger.error(f"Error adding track: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to add track"
+        )
+
+@app.post("/record-play", dependencies=[Depends(verify_app_integrity)])
+async def record_play(stat: PlayRecord):
+    """Record listening statistics"""
+    ensure_ready()
     
-    return result
+    try:
+        completion_rate = (
+            min(1.0, stat.listen_time_ms / stat.total_duration_ms)
+            if stat.total_duration_ms > 0 else 0
+        )
+        
+        state.supabase.rpc('upsert_listening_stat', {
+            'p_user_id': stat.user_id,
+            'p_track_id': stat.track_id,
+            'p_listen_time_ms': stat.listen_time_ms,
+            'p_completion_rate': completion_rate
+        }).execute()
+        
+        return {
+            "status": "success",
+            "completion_rate": round(completion_rate * 100, 2)
+        }
+    except Exception as e:
+        logger.error(f"Error recording play: {e}")
+        return {"status": "error", "message": "Failed to record play"}
+
+@app.post("/enrich-metadata", dependencies=[Depends(verify_app_integrity)])
+@limiter.limit(config.RATE_LIMIT_ENRICH)
+async def enrich_metadata(request: Request, song: SongRequest):
+    """AI-powered metadata enrichment"""
+    ensure_ready()
+    
+    # Generate cache key
+    cache_key = f"{song.artist.lower()}:{song.title.lower()}:{(song.album or '').lower()}"
+    
+    # Check cache
+    cached = await get_cached_metadata(cache_key)
+    if cached:
+        logger.info(f"Cache hit for: {cache_key}")
+        return cached
+    
+    try:
+        # Fetch external data concurrently
+        musicbrainz_task = search_musicbrainz(song.artist, song.title, song.album)
+        wiki_task = search_wikipedia(song.artist, song.album or "")
+        
+        musicbrainz_data, wiki_data = await asyncio.gather(
+            musicbrainz_task,
+            wiki_task,
+            return_exceptions=True
+        )
+        
+        # Handle exceptions
+        if isinstance(musicbrainz_data, Exception):
+            logger.error(f"MusicBrainz error: {musicbrainz_data}")
+            musicbrainz_data = {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
+        
+        if isinstance(wiki_data, Exception):
+            logger.error(f"Wikipedia error: {wiki_data}")
+            wiki_data = {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
+        
+        # Detect industry
+        industry = detect_industry_enhanced(
+            song.artist, song.title, song.album,
+            musicbrainz_data, wiki_data
+        )
+        
+        # AI enrichment
+        context_info = f"Artist: {song.artist}, Title: {song.title}"
+        if song.album:
+            context_info += f", Album: {song.album}"
+        
+        prompt = (
+            f"Analyze: {context_info}\n"
+            f"Detected Industry: {industry}\n"
+            "OUTPUT JSON: {\"mood\": \"...\", \"language\": \"...\", \"genre\": \"...\"}"
+        )
+        
+        try:
+            chat_completion = state.groq_client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a music metadata classifier. Output strict JSON only with keys: mood, language, genre."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                model=config.GROQ_MODEL,
+                temperature=0.1,
+                max_tokens=150,
+                response_format={"type": "json_object"}
+            )
+            
+            content = chat_completion.choices[0].message.content.strip()
+            ai_data = json.loads(content)
+            
+            mood = ai_data.get("mood", "Neutral").title()
+            language = ai_data.get("language", "Unknown").title()
+            genre = ai_data.get("genre", "Pop").title()
+            
+        except Exception as e:
+            logger.error(f"Groq AI error: {e}")
+            mood, language, genre = "Neutral", "Unknown", "Pop"
+        
+        result = {
+            "formatted": f"{mood};{language};{industry};{genre}",
+            "mood": mood,
+            "language": language,
+            "industry": industry,
+            "genre": genre,
+            "sources_used": {
+                "musicbrainz": musicbrainz_data.get("found", False),
+                "wikipedia": wiki_data.get("is_film_album", False),
+                "ai": True
+            }
+        }
+        
+        # Cache result
+        await set_cached_metadata(cache_key, result)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Metadata enrichment error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enrich metadata"
+        )
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "message": exc.detail,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Catch-all exception handler"""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "status": "error",
+            "message": "Internal server error",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import asyncio
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        access_log=True
+    )
