@@ -11,6 +11,7 @@ import time
 import logging
 import re
 from datetime import datetime
+from urllib.parse import unquote  # <--- ✅ ADDED THIS IMPORT
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
@@ -73,7 +74,7 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Starting AudioVibe API v16.0 (Merged)...")
+    logger.info("🚀 Starting AudioVibe API v16.1 (Fixed Stream URL)...")
     try:
         # 1. Supabase
         if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
@@ -115,7 +116,7 @@ async def lifespan(app: FastAPI):
         state.redis_client.close()
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="AudioVibe Secure API", version="16.0.0", lifespan=lifespan)
+app = FastAPI(title="AudioVibe Secure API", version="16.1.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -348,7 +349,7 @@ def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_d
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "16.0.0", "mode": "secure_paginated"}
+    return {"status": "online", "version": "16.1.0", "mode": "secure_paginated_fixed"}
 
 @app.get("/health")
 async def health_check():
@@ -359,7 +360,7 @@ async def health_check():
 async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, search: Optional[str] = None):
     """
     MERGED ENDPOINT:
-    Attempts Album-Based Pagination first (from your snippet).
+    Attempts Album-Based Pagination first.
     Falls back to Standard Pagination if view is missing.
     """
     ensure_ready()
@@ -370,7 +371,7 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
         end = start + limit - 1
         
         try:
-            # --- ATTEMPT 1: Album-Based Pagination (from your v10 code) ---
+            # --- ATTEMPT 1: Album-Based Pagination ---
             album_query = state.supabase.table("unique_albums").select("album, artist", count="exact")
             
             if search and search.strip():
@@ -380,7 +381,6 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
             album_query = album_query.order("created_at", desc=True).range(start, end)
             albums_response = album_query.execute()
             
-            # If no albums found or empty
             if not albums_response.data:
                 return {
                     "status": "success", "page": page, "total_albums": 0, "tracks": []
@@ -388,7 +388,6 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
 
             album_names = [album['album'] for album in albums_response.data]
             
-            # Fetch tracks for these albums
             tracks_query = state.supabase.table("music_tracks").select(
                 "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
             ).in_("album", album_names).order("created_at", desc=True)
@@ -405,7 +404,6 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
 
         except Exception:
             # --- ATTEMPT 2: Standard Pagination (Fallback) ---
-            # If 'unique_albums' view doesn't exist, this runs
             logger.info("⚠️ Falling back to standard pagination")
             
             query = state.supabase.table("music_tracks").select(
@@ -437,7 +435,7 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
 async def get_stream_url(request: Request, track_id: str):
     """
     SECURE STREAM ENDPOINT
-    Includes 'download' parameter fix for just_audio compatibility.
+    Includes 'download' parameter fix and URL decoding.
     """
     ensure_ready()
     try:
@@ -459,12 +457,17 @@ async def get_stream_url(request: Request, track_id: str):
         else:
             path = raw_url
             
-        # FIX: Ensure just_audio sees .mp3 extension
+        # ✅ CRITICAL FIX: Decode path to prevent double-encoding errors (e.g. %20 -> space)
+        decoded_path = unquote(path)
+            
+        # ✅ FIX: Ensure just_audio sees .mp3 extension
         safe_title = re.sub(r'[^a-zA-Z0-9]', '_', track.get('title', 'track'))
         download_filename = f"{safe_title}.mp3"
 
         signed = state.supabase.storage.from_("music_files").create_signed_url(
-            path, expiry, options={'download': download_filename}
+            decoded_path, # Use the decoded path here
+            expiry, 
+            options={'download': download_filename}
         )
         
         return {
@@ -509,8 +512,8 @@ async def record_play(stat: PlayRecord):
 async def enrich_metadata(request: Request, song: SongRequest):
     """
     Merged AI Logic:
-    - Uses strict Apple Music genres (from v15)
-    - Uses clean_json_response (from v10) for safety
+    - Uses strict Apple Music genres
+    - Uses clean_json_response for safety
     """
     ensure_ready()
     
@@ -567,7 +570,7 @@ async def enrich_metadata(request: Request, song: SongRequest):
             response_format={"type": "json_object"}
         )
         
-        # 4. Clean & Parse JSON (Merged Helper)
+        # 4. Clean & Parse JSON
         raw_content = chat_completion.choices[0].message.content.strip()
         cleaned_content = clean_json_response(raw_content)
         ai_data = json.loads(cleaned_content)
