@@ -166,7 +166,7 @@ app.add_middleware(
 )
 
 # ============================================================================
-# MODELS
+# MODELS (FIXED TO PREVENT 422 ERRORS)
 # ============================================================================
 
 class SongRequest(BaseModel):
@@ -175,24 +175,43 @@ class SongRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     album: Optional[str] = Field(None, max_length=200)
     
-    @field_validator('artist', 'title', 'album')
+    @field_validator('artist', 'title', 'album', mode='before')
     @classmethod
-    def clean_whitespace(cls, v: Optional[str]) -> Optional[str]:
+    def clean_whitespace(cls, v: Optional[Any]) -> Optional[str]:
         """Remove leading/trailing whitespace"""
-        return v.strip() if v else v
+        if v is None:
+            return None
+        return str(v).strip()
 
-# ✅ MODIFIED MODEL TO FIX 422 ERROR
 class TrackUpload(BaseModel):
     """Request model for uploading new tracks"""
     title: str = Field(..., min_length=1, max_length=200)
     artist: str = Field(..., min_length=1, max_length=200)
-    # 👇 CHANGE THIS LINE: Make album optional with a default value
-    album: Optional[str] = Field("Unknown Album", max_length=200) 
+    # ✅ FIX: Allow optional album, default to "Unknown Album"
+    album: Optional[str] = Field("Unknown Album", max_length=200)
     audio_file_url: str = Field(..., min_length=1)
     cover_image_url: Optional[str] = None
-    duration_ms: int = Field(..., ge=0)
+    duration_ms: int = Field(0, ge=0) 
     genres: List[str] = Field(default_factory=list)
-    tier_required: str = Field(default="free", pattern="^(free|pro|ultra_pro)$")
+    tier_required: str = Field(default="free")
+
+    @field_validator('album', mode='before')
+    @classmethod
+    def validate_album(cls, v):
+        # If album is None or empty, set default
+        if not v or str(v).strip() == "":
+            return "Unknown Album"
+        return str(v).strip()
+
+    @field_validator('tier_required', mode='before')
+    @classmethod
+    def validate_tier(cls, v):
+        # Normalize tier input
+        if not v: return "free"
+        v = str(v).lower()
+        if v not in ["free", "pro", "ultra_pro"]:
+            return "free" 
+        return v
 
 class PlayRecord(BaseModel):
     """Request model for recording play statistics"""
@@ -536,26 +555,12 @@ async def get_tracks_metadata(
 ):
     """
     Get tracks metadata with album-based pagination.
-    
-    This endpoint fetches complete albums to prevent splitting albums across pages.
-    - Fetches N albums per page
-    - Returns ALL tracks from those albums
-    - Supports search across title, artist, and album
-    
-    Args:
-        page: Page number (1-indexed)
-        limit: Number of albums per page (default: 50, max: 100)
-        search: Optional search query
-    
-    Returns:
-        JSON with paginated tracks grouped by albums
     """
     ensure_ready()
     
-    # Validate and cap parameters
     try:
-        page = max(1, int(page))  # Ensure page is at least 1
-        limit = min(max(1, int(limit)), config.MAX_PAGE_SIZE)  # Between 1 and MAX
+        page = max(1, int(page))
+        limit = min(max(1, int(limit)), config.MAX_PAGE_SIZE)
     except (ValueError, TypeError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -563,30 +568,25 @@ async def get_tracks_metadata(
         )
     
     try:
-        # Calculate pagination range
         start = (page - 1) * limit
         end = start + limit - 1
         
-        # Try album-based pagination first
         try:
-            # STEP 1: Fetch distinct albums (using the unique_albums view)
+            # STEP 1: Fetch distinct albums
             album_query = state.supabase.table("unique_albums").select(
                 "album, artist",
                 count="exact"
             )
             
-            # Apply search filter if provided
             if search and search.strip():
                 search_term = f"%{search.strip()}%"
                 album_query = album_query.or_(
                     f"album.ilike.{search_term},artist.ilike.{search_term}"
                 )
             
-            # Apply pagination and ordering
             album_query = album_query.order("created_at", desc=True).range(start, end)
             albums_response = album_query.execute()
             
-            # If no albums found, return empty result
             if not albums_response.data:
                 return {
                     "status": "success",
@@ -598,7 +598,6 @@ async def get_tracks_metadata(
                     "tracks": []
                 }
             
-            # Extract album names
             album_names = [album['album'] for album in albums_response.data]
             
             # STEP 2: Fetch ALL tracks for these albums
@@ -619,10 +618,8 @@ async def get_tracks_metadata(
             }
             
         except Exception as view_error:
-            # Fallback to standard track pagination if album view fails
             logger.warning(f"Album-based pagination failed, using fallback: {view_error}")
             
-            # Standard pagination fallback
             fallback_query = state.supabase.table("music_tracks").select(
                 "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at",
                 count="exact"
@@ -657,17 +654,10 @@ async def get_tracks_metadata(
 @app.get("/tracks/stream/{track_id}", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_STREAM)
 async def get_stream_url(request: Request, track_id: str):
-    """
-    Generate secure signed URL for streaming.
-    
-    Uses dynamic expiration based on content duration:
-    - Short content (<15 min): 8 minute expiration
-    - Long content (>15 min): 90 minute expiration
-    """
+    """Generate secure signed URL for streaming."""
     ensure_ready()
     
     try:
-        # Fetch track details
         response = state.supabase.table("music_tracks").select(
             "audio_file_url, duration_ms, title"
         ).eq("id", track_id).execute()
@@ -681,7 +671,6 @@ async def get_stream_url(request: Request, track_id: str):
         track = response.data[0]
         duration_ms = track.get('duration_ms', 0)
         
-        # Dynamic expiration based on duration
         is_long_content = (
             not duration_ms or
             duration_ms == 0 or
@@ -693,14 +682,12 @@ async def get_stream_url(request: Request, track_id: str):
             else config.SHORT_STREAM_EXPIRY
         )
         
-        # Extract file path from URL
         raw_url = track['audio_file_url']
         if "/music_files/" in raw_url:
             file_path = raw_url.split("/music_files/")[1]
         else:
             file_path = raw_url
         
-        # Generate signed URL from Supabase Storage
         signed_response = state.supabase.storage.from_("music_files").create_signed_url(
             file_path,
             expires_in
@@ -725,18 +712,11 @@ async def get_stream_url(request: Request, track_id: str):
 
 @app.post("/tracks", dependencies=[Depends(verify_app_integrity)])
 async def add_track(track: TrackUpload):
-    """
-    Add new track to database.
-    
-    TODO: Add proper admin authentication/authorization
-    """
+    """Add new track to database."""
     ensure_ready()
     
     try:
-        # Convert Pydantic model to dict (Pydantic v2 uses model_dump)
         data = track.model_dump()
-        
-        # Insert into database
         response = state.supabase.table("music_tracks").insert(data).execute()
         
         logger.info(f"Track added successfully: '{track.title}' by {track.artist}")
@@ -755,21 +735,15 @@ async def add_track(track: TrackUpload):
 
 @app.post("/record-play", dependencies=[Depends(verify_app_integrity)])
 async def record_play(stat: PlayRecord):
-    """
-    Record listening statistics for analytics.
-    
-    Calculates completion rate and stores in database using RPC.
-    """
+    """Record listening statistics for analytics."""
     ensure_ready()
     
     try:
-        # Calculate completion rate (0.0 to 1.0)
         completion_rate = (
             min(1.0, stat.listen_time_ms / stat.total_duration_ms)
             if stat.total_duration_ms > 0 else 0
         )
         
-        # Call database RPC function to upsert stats
         state.supabase.rpc('upsert_listening_stat', {
             'p_user_id': stat.user_id,
             'p_track_id': stat.track_id,
@@ -783,7 +757,6 @@ async def record_play(stat: PlayRecord):
         }
     except Exception as e:
         logger.error(f"Error recording play stats: {e}")
-        # Don't fail the request, just log the error
         return {
             "status": "error",
             "message": "Failed to record play statistics"
@@ -792,29 +765,17 @@ async def record_play(stat: PlayRecord):
 @app.post("/enrich-metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_ENRICH)
 async def enrich_metadata(request: Request, song: SongRequest):
-    """
-    AI-powered metadata enrichment.
-    
-    Uses multiple sources:
-    1. MusicBrainz API for official music data
-    2. Wikipedia API for album/soundtrack information
-    3. Groq AI for mood, language, and genre classification
-    
-    Results are cached in Redis for 1 hour.
-    """
+    """AI-powered metadata enrichment."""
     ensure_ready()
     
-    # Generate cache key
     cache_key = f"{song.artist.lower()}:{song.title.lower()}:{(song.album or '').lower()}"
     
-    # Check cache first
     cached = await get_cached_metadata(cache_key)
     if cached:
         logger.info(f"Cache hit for: {cache_key}")
         return cached
     
     try:
-        # Fetch external data concurrently for better performance
         musicbrainz_task = search_musicbrainz(song.artist, song.title, song.album)
         wiki_task = search_wikipedia(song.artist, song.album or "")
         
@@ -824,25 +785,14 @@ async def enrich_metadata(request: Request, song: SongRequest):
             return_exceptions=True
         )
         
-        # Handle exceptions from external APIs
         if isinstance(musicbrainz_data, Exception):
             logger.error(f"MusicBrainz error: {musicbrainz_data}")
-            musicbrainz_data = {
-                "found": False,
-                "release_type": "Unknown",
-                "labels": [],
-                "tags": []
-            }
+            musicbrainz_data = {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
         
         if isinstance(wiki_data, Exception):
             logger.error(f"Wikipedia error: {wiki_data}")
-            wiki_data = {
-                "is_soundtrack": False,
-                "is_film_album": False,
-                "industry_hints": []
-            }
+            wiki_data = {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
         
-        # Detect industry using enhanced logic
         industry = detect_industry_enhanced(
             song.artist,
             song.title,
@@ -851,7 +801,6 @@ async def enrich_metadata(request: Request, song: SongRequest):
             wiki_data
         )
         
-        # Prepare context for AI
         context_info = f"Artist: {song.artist}, Title: {song.title}"
         if song.album:
             context_info += f", Album: {song.album}"
@@ -863,7 +812,6 @@ async def enrich_metadata(request: Request, song: SongRequest):
             "Be specific and accurate."
         )
         
-        # AI enrichment using Groq
         try:
             chat_completion = state.groq_client.chat.completions.create(
                 messages=[
@@ -892,12 +840,10 @@ async def enrich_metadata(request: Request, song: SongRequest):
             
         except Exception as e:
             logger.error(f"Groq AI error: {e}")
-            # Fallback values if AI fails
             mood = "Neutral"
             language = "Unknown"
             genre = "Pop"
         
-        # Construct result
         result = {
             "formatted": f"{mood};{language};{industry};{genre}",
             "mood": mood,
@@ -911,11 +857,8 @@ async def enrich_metadata(request: Request, song: SongRequest):
             }
         }
         
-        # Cache result for future requests
         await set_cached_metadata(cache_key, result)
-        
         logger.info(f"Metadata enriched for: {song.title} by {song.artist}")
-        
         return result
         
     except Exception as e:
@@ -931,7 +874,6 @@ async def enrich_metadata(request: Request, song: SongRequest):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler"""
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -943,7 +885,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Catch-all exception handler for unhandled exceptions"""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -960,7 +901,6 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     import uvicorn
-    
     uvicorn.run(
         app,
         host="0.0.0.0",
