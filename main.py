@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse # <--- CHANGED
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any, Union
 import os
@@ -11,7 +11,7 @@ import time
 import logging
 import re
 from datetime import datetime
-from urllib.parse import unquote  # <--- ✅ ADDED THIS IMPORT
+from urllib.parse import unquote  # <--- CHANGED: Critical for filename decoding
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
@@ -53,9 +53,12 @@ class Config:
     EXTERNAL_API_TIMEOUT: int = 8
     METADATA_CACHE_TTL: int = 3600
     SHORT_STREAM_EXPIRY: int = 600  # 10 mins
-    LONG_STREAM_EXPIRY: int = 7200  # 2 hours
-    LONG_TRACK_THRESHOLD: int = 900000 # 15 mins
-    INTEGRITY_WINDOW: int = 60
+    LONG_STREAM_EXPIRY: int = 14400 # 4 hours (Allow long sessions)
+    LONG_TRACK_THRESHOLD: int = 900000 
+    
+    # Security
+    # CHANGED: Increased to 3 hours to allow seeking/buffering within a session
+    INTEGRITY_WINDOW: int = 10800 
     
     # AI Settings
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
@@ -74,21 +77,18 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Starting AudioVibe API v16.1 (Fixed Stream URL)...")
+    logger.info("🚀 Starting AudioVibe API v17.0 (Redirect Mode)...")
     try:
-        # 1. Supabase
         if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
             raise RuntimeError("Supabase credentials missing")
         state.supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
         logger.info("✅ Supabase connected")
         
-        # 2. Groq AI
         if not config.GROQ_API_KEY:
             raise RuntimeError("GROQ_API_KEY missing")
         state.groq_client = Groq(api_key=config.GROQ_API_KEY)
         logger.info("✅ Groq AI connected")
         
-        # 3. Redis (Optional)
         try:
             state.redis_client = redis.from_url(config.REDIS_URL, decode_responses=True, socket_connect_timeout=5)
             state.redis_client.ping()
@@ -97,7 +97,6 @@ async def lifespan(app: FastAPI):
             logger.warning(f"⚠️  Redis unavailable: {e}")
             state.redis_client = None
         
-        # 4. HTTP Client
         state.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.EXTERNAL_API_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
@@ -116,7 +115,7 @@ async def lifespan(app: FastAPI):
         state.redis_client.close()
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="AudioVibe Secure API", version="16.1.0", lifespan=lifespan)
+app = FastAPI(title="AudioVibe Secure API", version="17.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -195,6 +194,7 @@ def verify_app_integrity(
         current_time = int(time.time())
         time_diff = abs(current_time - request_time)
         
+        # Enforce window check
         if time_diff > config.INTEGRITY_WINDOW:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Request expired")
         
@@ -239,9 +239,7 @@ def ensure_ready():
         raise HTTPException(503, "Services unavailable")
 
 def clean_json_response(content: str) -> str:
-    """Helper to remove markdown from AI response"""
-    if not content:
-        return "{}"
+    if not content: return "{}"
     content = re.sub(r'```json\s*', '', content, flags=re.IGNORECASE)
     content = re.sub(r'```\s*', '', content)
     return content.strip()
@@ -251,16 +249,14 @@ async def get_cached_metadata(key: str) -> Optional[Dict]:
         try:
             data = state.redis_client.get(f"metadata:{key}")
             return json.loads(data) if data else None
-        except Exception:
-            pass
+        except Exception: pass
     return None
 
 async def set_cached_metadata(key: str, value: Dict) -> None:
     if state.redis_client:
         try:
             state.redis_client.setex(f"metadata:{key}", config.METADATA_CACHE_TTL, json.dumps(value))
-        except Exception:
-            pass
+        except Exception: pass
 
 async def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> Dict:
     try:
@@ -269,7 +265,7 @@ async def search_musicbrainz(artist: str, title: str, album: Optional[str] = Non
             query_parts.append(f'release:"{album}"')
         
         params = {"query": " AND ".join(query_parts), "fmt": "json", "limit": 2}
-        headers = {"User-Agent": "AudioVibe/16.0 (contact@audiovibe.app)"}
+        headers = {"User-Agent": "AudioVibe/17.0 (contact@audiovibe.app)"}
         
         response = await state.http_client.get(
             "https://musicbrainz.org/ws/2/recording/", params=params, headers=headers
@@ -317,29 +313,20 @@ async def search_wikipedia(artist: str, album: str) -> Dict:
                 if "telugu" in txt or "tollywood" in txt: hints.append("Tollywood")
                 if "tamil" in txt: hints.append("Kollywood")
             return {"hints": list(set(hints)), "is_soundtrack": is_soundtrack}
-    except Exception:
-        pass
+    except Exception: pass
     return {"hints": [], "is_soundtrack": False}
 
 def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_data: Dict, wiki_data: Dict) -> str:
-    """Robust Industry Detection Logic"""
     artist_lower = artist.lower()
-    
-    if wiki_data.get("hints"):
-        return wiki_data["hints"][0]
+    if wiki_data.get("hints"): return wiki_data["hints"][0]
 
     combined_text = f"{artist_lower} {' '.join(mb_data.get('labels', [])).lower()} {' '.join(mb_data.get('tags', [])).lower()}"
     
-    if any(x in combined_text for x in ["bollywood", "hindi", "t-series", "zee music", "tips"]):
-        return "Bollywood"
-    if any(x in combined_text for x in ["punjabi", "speed records", "white hill"]):
-        return "Punjabi"
-    if any(x in combined_text for x in ["tollywood", "telugu", "aditya music"]):
-        return "Tollywood"
-    if any(x in combined_text for x in ["atlantic", "columbia", "universal", "interscope"]):
-        return "International"
-    if any(name in artist_lower for name in ["kumar", "singh", "sharma", "khan"]):
-        return "Bollywood"
+    if any(x in combined_text for x in ["bollywood", "hindi", "t-series", "zee music", "tips"]): return "Bollywood"
+    if any(x in combined_text for x in ["punjabi", "speed records", "white hill"]): return "Punjabi"
+    if any(x in combined_text for x in ["tollywood", "telugu", "aditya music"]): return "Tollywood"
+    if any(x in combined_text for x in ["atlantic", "columbia", "universal", "interscope"]): return "International"
+    if any(name in artist_lower for name in ["kumar", "singh", "sharma", "khan"]): return "Bollywood"
 
     return "International"
 
@@ -349,7 +336,7 @@ def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_d
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "16.1.0", "mode": "secure_paginated_fixed"}
+    return {"status": "online", "version": "17.0.0", "mode": "redirect_stream_v2"}
 
 @app.get("/health")
 async def health_check():
@@ -358,11 +345,6 @@ async def health_check():
 @app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_TRACKS)
 async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, search: Optional[str] = None):
-    """
-    MERGED ENDPOINT:
-    Attempts Album-Based Pagination first.
-    Falls back to Standard Pagination if view is missing.
-    """
     ensure_ready()
     try:
         page = max(1, int(page))
@@ -371,9 +353,8 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
         end = start + limit - 1
         
         try:
-            # --- ATTEMPT 1: Album-Based Pagination ---
+            # Attempt 1: Album-Based Pagination
             album_query = state.supabase.table("unique_albums").select("album, artist", count="exact")
-            
             if search and search.strip():
                 term = f"%{search.strip()}%"
                 album_query = album_query.or_(f"album.ilike.{term},artist.ilike.{term}")
@@ -382,49 +363,28 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
             albums_response = album_query.execute()
             
             if not albums_response.data:
-                return {
-                    "status": "success", "page": page, "total_albums": 0, "tracks": []
-                }
+                return {"status": "success", "page": page, "total_albums": 0, "tracks": []}
 
             album_names = [album['album'] for album in albums_response.data]
-            
             tracks_query = state.supabase.table("music_tracks").select(
                 "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
             ).in_("album", album_names).order("created_at", desc=True)
             
             tracks_response = tracks_query.execute()
-            
-            return {
-                "status": "success",
-                "page": page,
-                "total_albums": albums_response.count,
-                "tracks": tracks_response.data,
-                "mode": "album_grouped"
-            }
+            return {"status": "success", "page": page, "total_albums": albums_response.count, "tracks": tracks_response.data, "mode": "album_grouped"}
 
         except Exception:
-            # --- ATTEMPT 2: Standard Pagination (Fallback) ---
-            logger.info("⚠️ Falling back to standard pagination")
-            
+            # Attempt 2: Standard Pagination Fallback
             query = state.supabase.table("music_tracks").select(
-                "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at",
-                count="exact"
+                "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at", count="exact"
             )
-            
             if search and search.strip():
                 term = f"%{search.strip()}%"
                 query = query.or_(f"title.ilike.{term},artist.ilike.{term},album.ilike.{term}")
             
             query = query.order("created_at", desc=True).range(start, end)
             response = query.execute()
-            
-            return {
-                "status": "success",
-                "page": page,
-                "total_count": response.count,
-                "tracks": response.data,
-                "mode": "standard"
-            }
+            return {"status": "success", "page": page, "total_count": response.count, "tracks": response.data, "mode": "standard"}
             
     except Exception as e:
         logger.error(f"Metadata error: {e}")
@@ -434,8 +394,10 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
 @limiter.limit(config.RATE_LIMIT_STREAM)
 async def get_stream_url(request: Request, track_id: str):
     """
-    SECURE STREAM ENDPOINT
-    Includes 'download' parameter fix and URL decoding.
+    PERMANENT LINK REDIRECT
+    1. Validates integrity headers.
+    2. Decodes filename (fixes Source Error).
+    3. Redirects (307) to the temporary signed URL.
     """
     ensure_ready()
     try:
@@ -457,24 +419,21 @@ async def get_stream_url(request: Request, track_id: str):
         else:
             path = raw_url
             
-        # ✅ CRITICAL FIX: Decode path to prevent double-encoding errors (e.g. %20 -> space)
+        # ✅ CRITICAL FIX: Decode path (e.g., 'Song%20Name.mp3' -> 'Song Name.mp3')
         decoded_path = unquote(path)
             
-        # ✅ FIX: Ensure just_audio sees .mp3 extension
         safe_title = re.sub(r'[^a-zA-Z0-9]', '_', track.get('title', 'track'))
         download_filename = f"{safe_title}.mp3"
 
         signed = state.supabase.storage.from_("music_files").create_signed_url(
-            decoded_path, # Use the decoded path here
+            decoded_path, 
             expiry, 
             options={'download': download_filename}
         )
         
-        return {
-            "stream_url": signed["signedURL"],
-            "expires_in": expiry,
-            "track_id": track_id
-        }
+        # ✅ CHANGED: Return Redirect instead of JSON
+        return RedirectResponse(url=signed["signedURL"], status_code=307)
+
     except Exception as e:
         logger.error(f"Stream error: {e}")
         raise HTTPException(500, "Failed to generate stream URL")
@@ -510,19 +469,12 @@ async def record_play(stat: PlayRecord):
 @app.post("/enrich-metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_ENRICH)
 async def enrich_metadata(request: Request, song: SongRequest):
-    """
-    Merged AI Logic:
-    - Uses strict Apple Music genres
-    - Uses clean_json_response for safety
-    """
     ensure_ready()
     
     cache_key = f"v5:{song.artist}:{song.title}:{song.album or ''}".lower()
-    if cached := await get_cached_metadata(cache_key):
-        return cached
+    if cached := await get_cached_metadata(cache_key): return cached
     
     try:
-        # 1. Async Context Gathering
         mb_task = search_musicbrainz(song.artist, song.title, song.album)
         wiki_task = search_wikipedia(song.artist, song.album or "")
         mb_data, wiki_data = await asyncio.gather(mb_task, wiki_task, return_exceptions=True)
@@ -533,55 +485,34 @@ async def enrich_metadata(request: Request, song: SongRequest):
         industry = detect_industry_enhanced(song.artist, song.title, song.album, mb_data, wiki_data)
 
         external_context = f"Detected Industry: {industry}. "
-        if mb_data.get("found"):
-            external_context += f"Tags: {', '.join(mb_data.get('tags', []))}. "
-        if wiki_data.get("hints"):
-            external_context += f"Keywords: {', '.join(wiki_data['hints'])}."
+        if mb_data.get("found"): external_context += f"Tags: {', '.join(mb_data.get('tags', []))}. "
+        if wiki_data.get("hints"): external_context += f"Keywords: {', '.join(wiki_data['hints'])}."
 
-        # 2. Strict Apple Music Prompt
         prompt = f"""
         Analyze song: "{song.title}" by "{song.artist}" (Album: {song.album}).
         Context: {external_context}
-
-        Task: Return a JSON object with strictly these fields.
-
-        1. "genre": Choose EXACTLY ONE from this Apple Music style list. Do not invent new ones.
-           [Pop, Hip-Hop/Rap, Bollywood, Punjabi Pop, R&B/Soul, Alternative, Rock, 
-            Indian Pop, Dance, Electronic, Singer/Songwriter, Classical, Jazz, K-Pop, 
-            Latin, Metal, Country, Blues, Devotional, Reggae]
-
-        2. "mood": Choose EXACTLY ONE: 
-           [Uplifting, Chill, Energetic, Melancholic, Romantic, Aggressive, Focus, Party]
-
-        3. "language": Detect primary language (e.g., Hindi, English, Punjabi, Spanish).
-
+        Task: Return JSON.
+        1. "genre": Choose ONE [Pop, Hip-Hop/Rap, Bollywood, Punjabi Pop, R&B/Soul, Alternative, Rock, Indian Pop, Dance, Electronic, Singer/Songwriter, Classical, Jazz, K-Pop, Latin, Metal, Country, Blues, Devotional, Reggae]
+        2. "mood": Choose ONE [Uplifting, Chill, Energetic, Melancholic, Romantic, Aggressive, Focus, Party]
+        3. "language": Detect primary language.
         JSON OUTPUT ONLY:
         """
 
-        # 3. Call Groq
         chat_completion = state.groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "You are a music taxonomist. Output strict JSON."},
                 {"role": "user", "content": prompt}
             ],
             model=config.GROQ_MODEL,
-            temperature=0.2,
-            max_tokens=150,
-            response_format={"type": "json_object"}
+            temperature=0.2, max_tokens=150, response_format={"type": "json_object"}
         )
         
-        # 4. Clean & Parse JSON
         raw_content = chat_completion.choices[0].message.content.strip()
         cleaned_content = clean_json_response(raw_content)
         ai_data = json.loads(cleaned_content)
         
-        # 5. Fallback Logic
         genre = ai_data.get("genre", "Pop").strip()
-        valid_genres = [
-            "Pop", "Hip-Hop/Rap", "Bollywood", "Punjabi Pop", "R&B/Soul", "Alternative", 
-            "Rock", "Indian Pop", "Dance", "Electronic", "Singer/Songwriter", 
-            "Classical", "Jazz", "K-Pop", "Latin", "Metal", "Country", "Blues", "Devotional"
-        ]
+        valid_genres = ["Pop", "Hip-Hop/Rap", "Bollywood", "Punjabi Pop", "R&B/Soul", "Alternative", "Rock", "Indian Pop", "Dance", "Electronic", "Singer/Songwriter", "Classical", "Jazz", "K-Pop", "Latin", "Metal", "Country", "Blues", "Devotional"]
         
         if genre not in valid_genres:
             if industry == "Bollywood": genre = "Bollywood"
@@ -603,11 +534,7 @@ async def enrich_metadata(request: Request, song: SongRequest):
 
     except Exception as e:
         logger.error(f"Enrichment failed: {e}")
-        return {
-            "mood": "Neutral", "language": "Unknown", 
-            "industry": "Unknown", "genre": "Pop", 
-            "formatted": "Neutral;Pop", "error": True
-        }
+        return {"mood": "Neutral", "language": "Unknown", "industry": "Unknown", "genre": "Pop", "formatted": "Neutral;Pop", "error": True}
 
 if __name__ == "__main__":
     import uvicorn
