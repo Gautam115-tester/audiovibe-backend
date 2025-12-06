@@ -36,10 +36,10 @@ class Config:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-    APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "")
-    UPLOAD_API_KEY: str = os.getenv("UPLOAD_API_KEY", "")
+    APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
+    UPLOAD_API_KEY: str = os.getenv("UPLOAD_API_KEY", "DONOTTOUCHAPI")
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
-    ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "").split(",")
+    ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     RATE_LIMIT_TRACKS: str = "60/minute"
     RATE_LIMIT_STREAM: str = "30/minute"
     RATE_LIMIT_ENRICH: str = "20/minute"
