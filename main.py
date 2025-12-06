@@ -9,6 +9,7 @@ import httpx
 import hashlib
 import time
 import logging
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -41,7 +42,7 @@ class Config:
     APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "change_this_secret")
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     
-    # CORS - IMPORTANT: Set proper origins in production
+    # CORS
     ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     
     # Rate Limiting
@@ -56,9 +57,9 @@ class Config:
     METADATA_CACHE_TTL: int = 3600  # 1 hour
     
     # Stream Expiration
-    SHORT_STREAM_EXPIRY: int = 480      # 8 minutes
-    LONG_STREAM_EXPIRY: int = 5400      # 90 minutes
-    LONG_TRACK_THRESHOLD: int = 900000  # 15 minutes in ms
+    SHORT_STREAM_EXPIRY: int = 480       # 8 minutes
+    LONG_STREAM_EXPIRY: int = 5400       # 90 minutes
+    LONG_TRACK_THRESHOLD: int = 900000   # 15 minutes in ms
     
     # Security
     INTEGRITY_WINDOW: int = 30  # seconds
@@ -67,7 +68,7 @@ class Config:
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     
     # Pagination
-    DEFAULT_PAGE_SIZE: int = 50  # Albums per page
+    DEFAULT_PAGE_SIZE: int = 50
     MAX_PAGE_SIZE: int = 100
 
 config = Config()
@@ -103,7 +104,7 @@ async def lifespan(app: FastAPI):
         state.groq_client = Groq(api_key=config.GROQ_API_KEY)
         logger.info("✅ Groq AI connected")
         
-        # Initialize Redis (optional, graceful degradation)
+        # Initialize Redis
         try:
             state.redis_client = redis.from_url(
                 config.REDIS_URL,
@@ -116,7 +117,7 @@ async def lifespan(app: FastAPI):
             logger.warning(f"⚠️  Redis unavailable (using in-memory fallback): {e}")
             state.redis_client = None
         
-        # Initialize HTTP Client with connection pooling
+        # Initialize HTTP Client
         state.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.EXTERNAL_API_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
@@ -155,7 +156,6 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,
@@ -166,7 +166,7 @@ app.add_middleware(
 )
 
 # ============================================================================
-# MODELS (FIXED TO PREVENT 422 ERRORS)
+# MODELS
 # ============================================================================
 
 class SongRequest(BaseModel):
@@ -178,7 +178,7 @@ class SongRequest(BaseModel):
     @field_validator('artist', 'title', 'album', mode='before')
     @classmethod
     def clean_whitespace(cls, v: Optional[Any]) -> Optional[str]:
-        """Remove leading/trailing whitespace"""
+        """Remove leading/trailing whitespace and handle None"""
         if v is None:
             return None
         return str(v).strip()
@@ -187,7 +187,6 @@ class TrackUpload(BaseModel):
     """Request model for uploading new tracks"""
     title: str = Field(..., min_length=1, max_length=200)
     artist: str = Field(..., min_length=1, max_length=200)
-    # ✅ FIX: Allow optional album, default to "Unknown Album"
     album: Optional[str] = Field("Unknown Album", max_length=200)
     audio_file_url: str = Field(..., min_length=1)
     cover_image_url: Optional[str] = None
@@ -198,7 +197,6 @@ class TrackUpload(BaseModel):
     @field_validator('album', mode='before')
     @classmethod
     def validate_album(cls, v):
-        # If album is None or empty, set default
         if not v or str(v).strip() == "":
             return "Unknown Album"
         return str(v).strip()
@@ -206,7 +204,6 @@ class TrackUpload(BaseModel):
     @field_validator('tier_required', mode='before')
     @classmethod
     def validate_tier(cls, v):
-        # Normalize tier input
         if not v: return "free"
         v = str(v).lower()
         if v not in ["free", "pro", "ultra_pro"]:
@@ -228,15 +225,11 @@ def verify_app_integrity(
     x_app_integrity: str = Header(..., description="SHA256 hash for integrity verification"),
     x_app_timestamp: str = Header(..., description="Unix timestamp")
 ) -> Dict[str, Any]:
-    """
-    Verify request integrity and prevent replay attacks.
-    This protects against unauthorized access from tools like Postman.
-    """
+    """Verify request integrity and prevent replay attacks."""
     try:
         request_time = int(x_app_timestamp)
         current_time = int(time.time())
         
-        # Check timestamp freshness (prevent replay attacks)
         if abs(current_time - request_time) > config.INTEGRITY_WINDOW:
             logger.warning(f"Expired request: timestamp={request_time}, current={current_time}")
             raise HTTPException(
@@ -244,7 +237,6 @@ def verify_app_integrity(
                 detail="Request expired"
             )
         
-        # Verify integrity hash: SHA256(APP_SECRET + timestamp)
         expected_hash = hashlib.sha256(
             f"{config.APP_SECRET}{x_app_timestamp}".encode()
         ).hexdigest()
@@ -289,6 +281,15 @@ def ensure_ready():
             detail="AI service unavailable"
         )
 
+def clean_json_response(content: str) -> str:
+    """Removes markdown code blocks (```json ... ```) from LLM response"""
+    if not content:
+        return "{}"
+    # Remove markdown code fences
+    content = re.sub(r'```json\s*', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'```\s*', '', content)
+    return content.strip()
+
 async def get_cached_metadata(key: str) -> Optional[Dict]:
     """Get metadata from Redis cache"""
     if state.redis_client:
@@ -314,7 +315,7 @@ async def set_cached_metadata(key: str, value: Dict) -> None:
 async def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> Dict:
     """Search MusicBrainz API for track metadata"""
     try:
-        base_url = "https://musicbrainz.org/ws/2/recording/"
+        base_url = "[https://musicbrainz.org/ws/2/recording/](https://musicbrainz.org/ws/2/recording/)"
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
         
         if album and album.lower() not in ["unknown", ""]:
@@ -369,7 +370,7 @@ async def search_wikipedia(artist: str, album: str) -> Dict:
         if not album or album.lower() in ["unknown", ""]:
             return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
         
-        search_url = "https://en.wikipedia.org/w/api.php"
+        search_url = "[https://en.wikipedia.org/w/api.php](https://en.wikipedia.org/w/api.php)"
         params = {
             "action": "query",
             "list": "search",
@@ -515,7 +516,6 @@ async def detailed_health_check():
     # Check HTTP Client
     services["http_client"] = state.http_client is not None
     
-    # System is healthy if database and AI are available
     all_healthy = services["database"] and services["ai"]
     
     return {
@@ -558,9 +558,7 @@ async def get_tracks_metadata(
     limit: int = 50,
     search: Optional[str] = None
 ):
-    """
-    Get tracks metadata with album-based pagination.
-    """
+    """Get tracks metadata with album-based pagination."""
     ensure_ready()
     
     try:
@@ -843,8 +841,10 @@ async def enrich_metadata(request: Request, song: SongRequest):
                 response_format={"type": "json_object"}
             )
             
-            content = chat_completion.choices[0].message.content.strip()
-            ai_data = json.loads(content)
+            # CRITICAL FIX: Use the cleaning helper before parsing JSON
+            raw_content = chat_completion.choices[0].message.content
+            cleaned_content = clean_json_response(raw_content)
+            ai_data = json.loads(cleaned_content)
             
             mood = ai_data.get("mood", "Neutral").title()
             language = ai_data.get("language", "Unknown").title()
