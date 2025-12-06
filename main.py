@@ -37,7 +37,7 @@ class Config:
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "change_this_secret")
-    UPLOAD_API_KEY: str = os.getenv("UPLOAD_API_KEY", "your_secure_upload_key_here")  # NEW!
+    UPLOAD_API_KEY: str = os.getenv("UPLOAD_API_KEY", "your_secure_upload_key_here")
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     RATE_LIMIT_TRACKS: str = "60/minute"
@@ -66,7 +66,7 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Starting AudioVibe API...")
+    logger.info("🚀 Starting AudioVibe API v13.0...")
     try:
         if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
             raise RuntimeError("Supabase credentials missing")
@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
         state.redis_client.close()
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="AudioVibe Secure API", version="12.0.0", lifespan=lifespan)
+app = FastAPI(title="AudioVibe Secure API", version="13.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -184,47 +184,42 @@ def verify_app_integrity(
     x_app_integrity: str = Header(..., description="SHA256 integrity hash"),
     x_app_timestamp: str = Header(..., description="Unix timestamp in seconds")
 ) -> Dict[str, Any]:
-    """
-    Verify request integrity using timestamp-based hash.
-    This prevents replay attacks and unauthorized access.
-    """
+    """Verify request integrity using timestamp-based hash"""
     try:
         request_time = int(x_app_timestamp)
         current_time = int(time.time())
         time_diff = abs(current_time - request_time)
         
-        # Check if request is within acceptable time window
         if time_diff > config.INTEGRITY_WINDOW:
-            logger.warning(f"⚠️  Expired request: diff={time_diff}s from IP={get_remote_address}")
+            logger.warning(f"⚠️  Expired request: diff={time_diff}s")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Request expired. Time difference: {time_diff} seconds. Max allowed: {config.INTEGRITY_WINDOW}s"
+                detail=f"Request expired. Time difference: {time_diff}s. Max: {config.INTEGRITY_WINDOW}s"
             )
         
-        # Verify integrity hash
         expected_hash = hashlib.sha256(
             f"{config.APP_SECRET}{x_app_timestamp}".encode()
         ).hexdigest()
         
         if x_app_integrity != expected_hash:
-            logger.warning(f"⚠️  Integrity check failed from IP={get_remote_address}")
+            logger.warning(f"⚠️  Integrity check failed")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Integrity verification failed. Check your APP_SECRET."
+                detail="Integrity verification failed"
             )
         
         return {"timestamp": request_time, "verified": True, "time_diff": time_diff}
         
     except ValueError as e:
-        logger.error(f"❌ Invalid timestamp format: {e}")
+        logger.error(f"❌ Invalid timestamp: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid timestamp format. Must be Unix timestamp in seconds."
+            detail="Invalid timestamp format"
         )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Integrity check error: {e}", exc_info=True)
+        logger.error(f"❌ Integrity error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Security verification failed"
@@ -233,56 +228,43 @@ def verify_app_integrity(
 def verify_upload_api_key(
     x_api_key: str = Header(..., description="Upload API Key")
 ) -> Dict[str, Any]:
-    """
-    Verify API key for upload operations.
-    This provides simple but effective upload security.
-    """
+    """Verify API key for upload operations"""
     if not x_api_key:
-        logger.warning("⚠️  Missing API key in upload request")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API key required. Include X-API-Key header."
+            detail="API key required"
         )
     
     if x_api_key != config.UPLOAD_API_KEY:
-        logger.warning(f"⚠️  Invalid API key attempt from IP={get_remote_address}")
+        logger.warning(f"⚠️  Invalid API key attempt")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key"
         )
     
-    logger.info(f"✅ Valid API key used for upload")
     return {"authenticated": True, "method": "api_key"}
 
-# Optional: Allow either integrity check OR API key for uploads
 async def verify_upload_auth(
     x_api_key: Optional[str] = Header(None),
     x_app_integrity: Optional[str] = Header(None),
     x_app_timestamp: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
-    """
-    Flexible upload authentication: accepts either API key OR integrity headers.
-    This allows both admin uploads (API key) and app uploads (integrity).
-    """
-    # Try API key first
+    """Flexible upload auth: API key OR integrity headers"""
     if x_api_key:
         try:
             return verify_upload_api_key(x_api_key)
         except HTTPException:
             pass
     
-    # Try integrity check
     if x_app_integrity and x_app_timestamp:
         try:
             return verify_app_integrity(x_app_integrity, x_app_timestamp)
         except HTTPException:
             pass
     
-    # Neither method worked
-    logger.warning("⚠️  Upload attempt with no valid authentication")
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required. Provide either X-API-Key or (X-App-Integrity + X-App-Timestamp)"
+        detail="Authentication required"
     )
 
 # ============================================================================
@@ -312,13 +294,14 @@ async def set_cached_metadata(key: str, value: Dict) -> None:
             pass
 
 async def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> Dict:
+    """Search MusicBrainz for metadata - FIXED VERSION"""
     try:
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
         if album and album.lower() not in ["unknown", "unknown album", ""]:
             query_parts.append(f'release:"{album}"')
         
         params = {"query": " AND ".join(query_parts), "fmt": "json", "limit": 3}
-        headers = {"User-Agent": "AudioVibe/12.0"}
+        headers = {"User-Agent": "AudioVibe/13.0"}
         
         response = await state.http_client.get(
             "https://musicbrainz.org/ws/2/recording/",
@@ -341,6 +324,7 @@ async def search_musicbrainz(artist: str, title: str, album: Optional[str] = Non
     return {"found": False, "labels": [], "tags": []}
 
 async def search_wikipedia(artist: str, album: str) -> Dict:
+    """Search Wikipedia for album info - FIXED VERSION"""
     try:
         if not album or album.lower() in ["unknown", "unknown album", ""]:
             return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
@@ -372,15 +356,26 @@ async def search_wikipedia(artist: str, album: str) -> Dict:
     return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
 
 def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_data: Dict, wiki_data: Dict) -> str:
+    """Enhanced industry detection - WORKING VERSION FROM OLD CODE"""
     if hints := wiki_data.get("industry_hints"):
         return hints[0]
+    
     combined = f"{artist} {album or ''} {' '.join(mb_data.get('labels',[]))}".lower()
-    if any(k in combined for k in ["bollywood", "hindi", "mumbai"]):
+    
+    if any(k in combined for k in ["bollywood", "hindi", "mumbai", "t-series", "zee music"]):
         return "Bollywood"
-    if any(k in combined for k in ["tollywood", "telugu", "tamil"]):
+    if any(k in combined for k in ["tollywood", "telugu", "tamil", "kollywood"]):
         return "Tollywood"
     if "punjabi" in combined:
         return "Punjabi"
+    
+    western_labels = ["atlantic", "columbia", "universal", "warner", "epic"]
+    if any(label in combined for label in western_labels):
+        return "International"
+    
+    if "independent" in combined or "indie" in combined:
+        return "Indie"
+    
     return "International"
 
 # ============================================================================
@@ -389,34 +384,26 @@ def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_d
 
 @app.get("/")
 async def root():
-    """API Information"""
     return {
         "name": "AudioVibe Secure API",
-        "version": "12.0.0",
+        "version": "13.0.0",
         "status": "online",
-        "security": {
-            "metadata_endpoint": "Requires X-App-Integrity + X-App-Timestamp headers",
-            "upload_endpoint": "Requires X-API-Key OR integrity headers",
-            "stream_endpoint": "Requires X-App-Integrity + X-App-Timestamp headers"
-        },
-        "docs": "/docs",
-        "endpoints": {
-            "health": "GET /health",
-            "metadata": "GET /tracks/metadata (secured)",
-            "stream": "GET /tracks/stream/{id} (secured)",
-            "upload": "POST /tracks (secured with API key)",
-            "enrich": "POST /enrich-metadata (secured)"
-        }
+        "security": "enabled",
+        "fixes": ["AI enrichment restored", "Pagination added", "Security enhanced"],
+        "docs": "/docs"
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint - No authentication required"""
     return {
         "status": "healthy",
-        "version": "12.0.0",
+        "version": "13.0.0",
         "timestamp": datetime.utcnow().isoformat(),
-        "security": "enabled"
+        "services": {
+            "supabase": bool(state.supabase),
+            "groq": bool(state.groq_client),
+            "redis": bool(state.redis_client)
+        }
     }
 
 @app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
@@ -427,17 +414,14 @@ async def get_tracks_metadata(
     limit: int = 50,
     search: Optional[str] = None
 ):
-    """
-    Get tracks metadata with pagination - SECURED
-    Requires: X-App-Integrity and X-App-Timestamp headers
-    """
+    """Get tracks with pagination - SECURED"""
     ensure_ready()
     
     try:
         page = max(1, int(page))
         limit = min(max(1, int(limit)), config.MAX_PAGE_SIZE)
     except (ValueError, TypeError):
-        raise HTTPException(422, "Invalid page or limit parameter")
+        raise HTTPException(422, "Invalid page or limit")
     
     try:
         start = (page - 1) * limit
@@ -472,10 +456,7 @@ async def get_tracks_metadata(
 @app.get("/tracks/stream/{track_id}", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_STREAM)
 async def get_stream_url(request: Request, track_id: str):
-    """
-    Generate signed stream URL - SECURED
-    Requires: X-App-Integrity and X-App-Timestamp headers
-    """
+    """Generate signed stream URL - SECURED"""
     ensure_ready()
     
     try:
@@ -495,7 +476,7 @@ async def get_stream_url(request: Request, track_id: str):
         path = raw_url.split("/music_files/")[1] if "/music_files/" in raw_url else raw_url
         signed = state.supabase.storage.from_("music_files").create_signed_url(path, expiry)
         
-        logger.info(f"🎵 Stream URL generated for: {track.get('title')} by {track.get('artist')}")
+        logger.info(f"🎵 Stream URL: {track.get('title')} by {track.get('artist')}")
         
         return {
             "stream_url": signed["signedURL"],
@@ -512,22 +493,18 @@ async def get_stream_url(request: Request, track_id: str):
 @app.post("/tracks", dependencies=[Depends(verify_upload_auth)])
 @limiter.limit(config.RATE_LIMIT_UPLOAD)
 async def add_track(request: Request, track: TrackUpload):
-    """
-    Upload track - SECURED with flexible auth
-    Method 1: X-API-Key header (for admin/backend uploads)
-    Method 2: X-App-Integrity + X-App-Timestamp headers (for app uploads)
-    """
+    """Upload track - SECURED (API key OR integrity)"""
     ensure_ready()
     
     try:
         data = track.model_dump()
-        logger.info(f"📤 Uploading: '{data['title']}' by {data['artist']} (Album: {data['album']})")
+        logger.info(f"📤 Uploading: '{data['title']}' by {data['artist']}")
         
         response = state.supabase.table("music_tracks").insert(data).execute()
         
         if response.data:
             track_id = response.data[0].get('id', 'unknown')
-            logger.info(f"✅ Upload successful! Track ID: {track_id}")
+            logger.info(f"✅ Upload successful! ID: {track_id}")
             return {
                 "status": "success",
                 "message": "Track uploaded successfully",
@@ -542,10 +519,7 @@ async def add_track(request: Request, track: TrackUpload):
 
 @app.post("/record-play", dependencies=[Depends(verify_app_integrity)])
 async def record_play(stat: PlayRecord):
-    """
-    Record play statistics - SECURED
-    Requires: X-App-Integrity and X-App-Timestamp headers
-    """
+    """Record play statistics - SECURED"""
     ensure_ready()
     
     try:
@@ -558,7 +532,7 @@ async def record_play(stat: PlayRecord):
             'p_completion_rate': rate
         }).execute()
         
-        logger.info(f"📊 Play recorded: user={stat.user_id}, track={stat.track_id}, completion={rate*100:.1f}%")
+        logger.info(f"📊 Play recorded: user={stat.user_id}, track={stat.track_id}, rate={rate*100:.1f}%")
         return {"status": "success", "completion_rate": round(rate * 100, 2)}
         
     except Exception as e:
@@ -569,9 +543,8 @@ async def record_play(stat: PlayRecord):
 @limiter.limit(config.RATE_LIMIT_ENRICH)
 async def enrich_metadata(request: Request, song: SongRequest):
     """
-    AI metadata enrichment - SECURED
-    Returns ALL 4 fields: mood, language, industry, genre
-    Requires: X-App-Integrity and X-App-Timestamp headers
+    AI metadata enrichment - FIXED & WORKING
+    Returns: mood, language, industry, genre
     """
     ensure_ready()
     
@@ -594,38 +567,46 @@ async def enrich_metadata(request: Request, song: SongRequest):
         
         industry = detect_industry_enhanced(song.artist, song.title, song.album, mb_data, wiki_data)
         
+        # Build context
         context = f"Song: '{song.title}' by {song.artist}"
         if song.album:
             context += f" from album '{song.album}'"
+        if mb_data.get("found"):
+            context += f", Labels: {', '.join(mb_data['labels'][:2])}"
+        if wiki_data.get("is_film_album"):
+            context += ", Type: Film Soundtrack"
         
-        prompt = f"""Analyze this music track and provide metadata:
-
-{context}
+        # AI prompt - WORKING VERSION FROM OLD CODE
+        prompt = f"""Analyze: {context}
 Detected Industry: {industry}
 
-YOU MUST provide ALL FOUR fields in your JSON response:
-1. mood - The emotional feeling (e.g., Happy, Sad, Energetic, Romantic, Melancholic)
-2. language - The primary language of lyrics (e.g., English, Hindi, Punjabi, Tamil, Telugu)
-3. genre - The specific music genre (e.g., Pop, Rock, Hip-Hop, EDM, Bollywood, K-Pop)
-4. industry - Keep as "{industry}"
+TASK 1: MOOD
+   Options: Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting
 
-Output ONLY valid JSON with ALL FOUR keys:
-{{"mood": "...", "language": "...", "genre": "...", "industry": "{industry}"}}"""
+TASK 2: LANGUAGE
+   Detect primary language (Hindi, Telugu, Tamil, Punjabi, English, etc.)
+
+TASK 3: GENRE (Simple categories)
+   Options: Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz
+
+OUTPUT JSON:
+{{
+  "mood": "...",
+  "language": "...",
+  "genre": "..."
+}}"""
 
         try:
             logger.info(f"🤖 Enriching: '{song.title}' by {song.artist}")
             
             chat_completion = state.groq_client.chat.completions.create(
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a music metadata expert. Output ONLY valid JSON with exactly 4 keys: mood, language, genre, industry. No markdown, just JSON."
-                    },
+                    {"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
                     {"role": "user", "content": prompt}
                 ],
                 model=config.GROQ_MODEL,
-                temperature=0.2,
-                max_tokens=200,
+                temperature=0.1,
+                max_tokens=150,
                 response_format={"type": "json_object"}
             )
             
@@ -635,10 +616,8 @@ Output ONLY valid JSON with ALL FOUR keys:
             mood = ai_data.get("mood", "Neutral").strip().title()
             language = ai_data.get("language", "Unknown").strip().title()
             genre = ai_data.get("genre", "Pop").strip().title()
-            if ai_data.get("industry"):
-                industry = ai_data.get("industry").strip().title()
             
-            logger.info(f"✅ Enriched: mood={mood}, language={language}, genre={genre}, industry={industry}")
+            logger.info(f"✅ AI: mood={mood}, language={language}, genre={genre}")
             
         except Exception as e:
             logger.error(f"❌ AI error: {e}")
