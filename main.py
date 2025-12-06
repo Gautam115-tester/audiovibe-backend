@@ -37,6 +37,7 @@ class Config:
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "change_this_secret")
+    UPLOAD_API_KEY: str = os.getenv("UPLOAD_API_KEY", "your_secure_upload_key_here")  # NEW!
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     RATE_LIMIT_TRACKS: str = "60/minute"
@@ -103,7 +104,7 @@ async def lifespan(app: FastAPI):
         state.redis_client.close()
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="AudioVibe Secure API", version="11.0.0", lifespan=lifespan)
+app = FastAPI(title="AudioVibe Secure API", version="12.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -176,32 +177,113 @@ class PlayRecord(BaseModel):
     total_duration_ms: int = Field(..., gt=0)
 
 # ============================================================================
-# SECURITY
+# SECURITY DEPENDENCIES
 # ============================================================================
 
 def verify_app_integrity(
-    x_app_integrity: str = Header(...),
-    x_app_timestamp: str = Header(...)
+    x_app_integrity: str = Header(..., description="SHA256 integrity hash"),
+    x_app_timestamp: str = Header(..., description="Unix timestamp in seconds")
 ) -> Dict[str, Any]:
+    """
+    Verify request integrity using timestamp-based hash.
+    This prevents replay attacks and unauthorized access.
+    """
     try:
         request_time = int(x_app_timestamp)
         current_time = int(time.time())
+        time_diff = abs(current_time - request_time)
         
-        if abs(current_time - request_time) > config.INTEGRITY_WINDOW:
-            raise HTTPException(403, f"Request expired (diff: {abs(current_time - request_time)}s)")
+        # Check if request is within acceptable time window
+        if time_diff > config.INTEGRITY_WINDOW:
+            logger.warning(f"⚠️  Expired request: diff={time_diff}s from IP={get_remote_address}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Request expired. Time difference: {time_diff} seconds. Max allowed: {config.INTEGRITY_WINDOW}s"
+            )
         
-        expected_hash = hashlib.sha256(f"{config.APP_SECRET}{x_app_timestamp}".encode()).hexdigest()
+        # Verify integrity hash
+        expected_hash = hashlib.sha256(
+            f"{config.APP_SECRET}{x_app_timestamp}".encode()
+        ).hexdigest()
+        
         if x_app_integrity != expected_hash:
-            raise HTTPException(403, "Integrity verification failed")
+            logger.warning(f"⚠️  Integrity check failed from IP={get_remote_address}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Integrity verification failed. Check your APP_SECRET."
+            )
         
-        return {"timestamp": request_time, "verified": True}
-    except ValueError:
-        raise HTTPException(400, "Invalid timestamp format")
+        return {"timestamp": request_time, "verified": True, "time_diff": time_diff}
+        
+    except ValueError as e:
+        logger.error(f"❌ Invalid timestamp format: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid timestamp format. Must be Unix timestamp in seconds."
+        )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Integrity check error: {e}")
-        raise HTTPException(403, "Security verification failed")
+        logger.error(f"❌ Integrity check error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Security verification failed"
+        )
+
+def verify_upload_api_key(
+    x_api_key: str = Header(..., description="Upload API Key")
+) -> Dict[str, Any]:
+    """
+    Verify API key for upload operations.
+    This provides simple but effective upload security.
+    """
+    if not x_api_key:
+        logger.warning("⚠️  Missing API key in upload request")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required. Include X-API-Key header."
+        )
+    
+    if x_api_key != config.UPLOAD_API_KEY:
+        logger.warning(f"⚠️  Invalid API key attempt from IP={get_remote_address}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key"
+        )
+    
+    logger.info(f"✅ Valid API key used for upload")
+    return {"authenticated": True, "method": "api_key"}
+
+# Optional: Allow either integrity check OR API key for uploads
+async def verify_upload_auth(
+    x_api_key: Optional[str] = Header(None),
+    x_app_integrity: Optional[str] = Header(None),
+    x_app_timestamp: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """
+    Flexible upload authentication: accepts either API key OR integrity headers.
+    This allows both admin uploads (API key) and app uploads (integrity).
+    """
+    # Try API key first
+    if x_api_key:
+        try:
+            return verify_upload_api_key(x_api_key)
+        except HTTPException:
+            pass
+    
+    # Try integrity check
+    if x_app_integrity and x_app_timestamp:
+        try:
+            return verify_app_integrity(x_app_integrity, x_app_timestamp)
+        except HTTPException:
+            pass
+    
+    # Neither method worked
+    logger.warning("⚠️  Upload attempt with no valid authentication")
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required. Provide either X-API-Key or (X-App-Integrity + X-App-Timestamp)"
+    )
 
 # ============================================================================
 # HELPERS
@@ -236,7 +318,7 @@ async def search_musicbrainz(artist: str, title: str, album: Optional[str] = Non
             query_parts.append(f'release:"{album}"')
         
         params = {"query": " AND ".join(query_parts), "fmt": "json", "limit": 3}
-        headers = {"User-Agent": "AudioVibe/11.0"}
+        headers = {"User-Agent": "AudioVibe/12.0"}
         
         response = await state.http_client.get(
             "https://musicbrainz.org/ws/2/recording/",
@@ -307,42 +389,55 @@ def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_d
 
 @app.get("/")
 async def root():
+    """API Information"""
     return {
         "name": "AudioVibe Secure API",
-        "version": "11.0.0",
+        "version": "12.0.0",
         "status": "online",
+        "security": {
+            "metadata_endpoint": "Requires X-App-Integrity + X-App-Timestamp headers",
+            "upload_endpoint": "Requires X-API-Key OR integrity headers",
+            "stream_endpoint": "Requires X-App-Integrity + X-App-Timestamp headers"
+        },
         "docs": "/docs",
         "endpoints": {
             "health": "GET /health",
-            "metadata": "GET /tracks/metadata",
-            "stream": "GET /tracks/stream/{id}",
-            "upload": "POST /tracks",
-            "enrich": "POST /enrich-metadata"
+            "metadata": "GET /tracks/metadata (secured)",
+            "stream": "GET /tracks/stream/{id} (secured)",
+            "upload": "POST /tracks (secured with API key)",
+            "enrich": "POST /enrich-metadata (secured)"
         }
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "11.0.0", "timestamp": datetime.utcnow().isoformat()}
-
-@app.get("/debug/tracks")
-async def debug_tracks(limit: int = 10):
-    ensure_ready()
-    try:
-        response = state.supabase.table("music_tracks").select("*").limit(limit).execute()
-        return {"status": "success", "count": len(response.data), "tracks": response.data}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    """Health check endpoint - No authentication required"""
+    return {
+        "status": "healthy",
+        "version": "12.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "security": "enabled"
+    }
 
 @app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_TRACKS)
-async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, search: Optional[str] = None):
+async def get_tracks_metadata(
+    request: Request,
+    page: int = 1,
+    limit: int = 50,
+    search: Optional[str] = None
+):
+    """
+    Get tracks metadata with pagination - SECURED
+    Requires: X-App-Integrity and X-App-Timestamp headers
+    """
     ensure_ready()
+    
     try:
         page = max(1, int(page))
         limit = min(max(1, int(limit)), config.MAX_PAGE_SIZE)
     except (ValueError, TypeError):
-        raise HTTPException(422, "Invalid page or limit")
+        raise HTTPException(422, "Invalid page or limit parameter")
     
     try:
         start = (page - 1) * limit
@@ -360,6 +455,8 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
         query = query.order("created_at", desc=True).range(start, end)
         response = query.execute()
         
+        logger.info(f"📋 Fetched {len(response.data)} tracks (page {page})")
+        
         return {
             "status": "success",
             "page": page,
@@ -369,15 +466,23 @@ async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, 
             "tracks": response.data
         }
     except Exception as e:
-        logger.error(f"Metadata error: {e}", exc_info=True)
+        logger.error(f"❌ Metadata error: {e}", exc_info=True)
         raise HTTPException(500, f"Failed to fetch tracks: {str(e)}")
 
 @app.get("/tracks/stream/{track_id}", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_STREAM)
 async def get_stream_url(request: Request, track_id: str):
+    """
+    Generate signed stream URL - SECURED
+    Requires: X-App-Integrity and X-App-Timestamp headers
+    """
     ensure_ready()
+    
     try:
-        response = state.supabase.table("music_tracks").select("audio_file_url, duration_ms").eq("id", track_id).execute()
+        response = state.supabase.table("music_tracks").select(
+            "audio_file_url, duration_ms, title, artist"
+        ).eq("id", track_id).execute()
+        
         if not response.data:
             raise HTTPException(404, "Track not found")
         
@@ -390,51 +495,94 @@ async def get_stream_url(request: Request, track_id: str):
         path = raw_url.split("/music_files/")[1] if "/music_files/" in raw_url else raw_url
         signed = state.supabase.storage.from_("music_files").create_signed_url(path, expiry)
         
-        return {"stream_url": signed["signedURL"], "expires_in": expiry, "track_id": track_id}
+        logger.info(f"🎵 Stream URL generated for: {track.get('title')} by {track.get('artist')}")
+        
+        return {
+            "stream_url": signed["signedURL"],
+            "expires_in": expiry,
+            "expires_at": int(time.time()) + expiry,
+            "track_id": track_id
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Stream error: {e}")
+        logger.error(f"❌ Stream error: {e}")
         raise HTTPException(500, "Failed to generate stream URL")
 
-@app.post("/tracks")
+@app.post("/tracks", dependencies=[Depends(verify_upload_auth)])
 @limiter.limit(config.RATE_LIMIT_UPLOAD)
 async def add_track(request: Request, track: TrackUpload):
-    """Upload track - NO AUTH REQUIRED"""
+    """
+    Upload track - SECURED with flexible auth
+    Method 1: X-API-Key header (for admin/backend uploads)
+    Method 2: X-App-Integrity + X-App-Timestamp headers (for app uploads)
+    """
     ensure_ready()
+    
     try:
         data = track.model_dump()
-        logger.info(f"📤 Uploading: {data['title']} by {data['artist']}")
+        logger.info(f"📤 Uploading: '{data['title']}' by {data['artist']} (Album: {data['album']})")
+        
         response = state.supabase.table("music_tracks").insert(data).execute()
-        logger.info(f"✅ Upload successful: {response.data[0]['id'] if response.data else 'unknown'}")
-        return {"status": "success", "message": "Track uploaded", "data": response.data[0] if response.data else None}
+        
+        if response.data:
+            track_id = response.data[0].get('id', 'unknown')
+            logger.info(f"✅ Upload successful! Track ID: {track_id}")
+            return {
+                "status": "success",
+                "message": "Track uploaded successfully",
+                "data": response.data[0]
+            }
+        else:
+            raise Exception("No data returned from database")
+            
     except Exception as e:
         logger.error(f"❌ Upload error: {e}", exc_info=True)
         raise HTTPException(500, f"Upload failed: {str(e)}")
 
 @app.post("/record-play", dependencies=[Depends(verify_app_integrity)])
 async def record_play(stat: PlayRecord):
+    """
+    Record play statistics - SECURED
+    Requires: X-App-Integrity and X-App-Timestamp headers
+    """
     ensure_ready()
+    
     try:
         rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
+        
         state.supabase.rpc('upsert_listening_stat', {
-            'p_user_id': stat.user_id, 'p_track_id': stat.track_id,
-            'p_listen_time_ms': stat.listen_time_ms, 'p_completion_rate': rate
+            'p_user_id': stat.user_id,
+            'p_track_id': stat.track_id,
+            'p_listen_time_ms': stat.listen_time_ms,
+            'p_completion_rate': rate
         }).execute()
-        return {"status": "success"}
-    except Exception:
-        return {"status": "error"}
+        
+        logger.info(f"📊 Play recorded: user={stat.user_id}, track={stat.track_id}, completion={rate*100:.1f}%")
+        return {"status": "success", "completion_rate": round(rate * 100, 2)}
+        
+    except Exception as e:
+        logger.error(f"❌ Record play error: {e}")
+        return {"status": "error", "message": "Failed to record play"}
 
 @app.post("/enrich-metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_ENRICH)
 async def enrich_metadata(request: Request, song: SongRequest):
-    """AI enrichment - Returns ALL 4 fields: mood, language, industry, genre"""
+    """
+    AI metadata enrichment - SECURED
+    Returns ALL 4 fields: mood, language, industry, genre
+    Requires: X-App-Integrity and X-App-Timestamp headers
+    """
     ensure_ready()
     
     cache_key = f"{song.artist}:{song.title}:{song.album or ''}".lower()
+    
     if cached := await get_cached_metadata(cache_key):
         logger.info(f"✅ Cache hit: {cache_key}")
         return cached
     
     try:
+        # Fetch external data
         mb_task = search_musicbrainz(song.artist, song.title, song.album)
         wiki_task = search_wikipedia(song.artist, song.album or "")
         mb_data, wiki_data = await asyncio.gather(mb_task, wiki_task, return_exceptions=True)
@@ -465,10 +613,14 @@ Output ONLY valid JSON with ALL FOUR keys:
 {{"mood": "...", "language": "...", "genre": "...", "industry": "{industry}"}}"""
 
         try:
-            logger.info(f"🤖 Enriching: {song.title}")
+            logger.info(f"🤖 Enriching: '{song.title}' by {song.artist}")
+            
             chat_completion = state.groq_client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "You are a music metadata expert. Output ONLY valid JSON with exactly 4 keys: mood, language, genre, industry. No markdown, just JSON."},
+                    {
+                        "role": "system",
+                        "content": "You are a music metadata expert. Output ONLY valid JSON with exactly 4 keys: mood, language, genre, industry. No markdown, just JSON."
+                    },
                     {"role": "user", "content": prompt}
                 ],
                 model=config.GROQ_MODEL,
@@ -478,7 +630,6 @@ Output ONLY valid JSON with ALL FOUR keys:
             )
             
             content = chat_completion.choices[0].message.content.strip()
-            logger.info(f"🤖 AI Response: {content}")
             ai_data = json.loads(content)
             
             mood = ai_data.get("mood", "Neutral").strip().title()
@@ -487,7 +638,8 @@ Output ONLY valid JSON with ALL FOUR keys:
             if ai_data.get("industry"):
                 industry = ai_data.get("industry").strip().title()
             
-            logger.info(f"✅ Parsed: mood={mood}, language={language}, genre={genre}, industry={industry}")
+            logger.info(f"✅ Enriched: mood={mood}, language={language}, genre={genre}, industry={industry}")
+            
         except Exception as e:
             logger.error(f"❌ AI error: {e}")
             mood, language, genre = "Neutral", "Unknown", "Pop"
@@ -507,25 +659,43 @@ Output ONLY valid JSON with ALL FOUR keys:
         
         await set_cached_metadata(cache_key, result)
         logger.info(f"✅ Enrichment complete: {result['formatted']}")
+        
         return result
+        
     except Exception as e:
         logger.error(f"❌ Enrichment error: {e}", exc_info=True)
         raise HTTPException(500, f"Enrichment failed: {str(e)}")
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={"status": "error", "message": exc.detail, "timestamp": datetime.utcnow().isoformat()}
+        content={
+            "status": "error",
+            "message": exc.detail,
+            "timestamp": datetime.utcnow().isoformat()
+        }
     )
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error(f"❌ Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"status": "error", "message": "Internal server error", "timestamp": datetime.utcnow().isoformat()}
+        content={
+            "status": "error",
+            "message": "Internal server error",
+            "timestamp": datetime.utcnow().isoformat()
+        }
     )
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
