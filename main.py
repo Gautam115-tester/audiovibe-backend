@@ -435,14 +435,19 @@ def detect_industry_enhanced(
     combined = f"{artist_lower} {album_lower} {labels} {tags}"
     
     industry_keywords = {
-        "Bollywood": ["bollywood", "hindi", "mumbai"],
-        "Tollywood": ["tollywood", "telugu", "tamil"],
-        "Punjabi": ["punjabi"],
+        "Bollywood": ["bollywood", "hindi", "mumbai", "t-series", "zee music"],
+        "Tollywood": ["tollywood", "telugu", "tamil", "aditya music"],
+        "Punjabi": ["punjabi", "speed records", "white hill"],
     }
     
     for industry, keywords in industry_keywords.items():
         if any(keyword in combined for keyword in keywords):
             return industry
+            
+    # Priority 3: Western Indicators
+    western_indicators = ["atlantic", "columbia", "universal", "warner", "republic"]
+    if any(ind in labels for ind in western_indicators):
+        return "International"
     
     return "International"
 
@@ -765,7 +770,7 @@ async def record_play(stat: PlayRecord):
 @app.post("/enrich-metadata", dependencies=[Depends(verify_app_integrity)])
 @limiter.limit(config.RATE_LIMIT_ENRICH)
 async def enrich_metadata(request: Request, song: SongRequest):
-    """AI-powered metadata enrichment."""
+    """AI-powered metadata enrichment with strict 4-part structure."""
     ensure_ready()
     
     cache_key = f"{song.artist.lower()}:{song.title.lower()}:{(song.album or '').lower()}"
@@ -776,6 +781,7 @@ async def enrich_metadata(request: Request, song: SongRequest):
         return cached
     
     try:
+        # 1. External Data Fetching
         musicbrainz_task = search_musicbrainz(song.artist, song.title, song.album)
         wiki_task = search_wikipedia(song.artist, song.album or "")
         
@@ -793,6 +799,7 @@ async def enrich_metadata(request: Request, song: SongRequest):
             logger.error(f"Wikipedia error: {wiki_data}")
             wiki_data = {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
         
+        # 2. Industry Detection (Python Logic)
         industry = detect_industry_enhanced(
             song.artist,
             song.title,
@@ -801,15 +808,24 @@ async def enrich_metadata(request: Request, song: SongRequest):
             wiki_data
         )
         
+        # 3. Build Prompt for AI (Strict 4-part Logic)
         context_info = f"Artist: {song.artist}, Title: {song.title}"
         if song.album:
             context_info += f", Album: {song.album}"
         
+        # Adding labels/tags to context if available
+        if musicbrainz_data.get("found"):
+            context_info += f", Labels: {', '.join(musicbrainz_data['labels'][:2])}"
+            context_info += f", Tags: {', '.join(musicbrainz_data['tags'][:3])}"
+        
         prompt = (
             f"Analyze this music: {context_info}\n"
-            f"Detected Industry: {industry}\n"
-            "Output JSON with keys: mood, language, genre\n"
-            "Be specific and accurate."
+            f"Detected Industry: {industry}\n\n"
+            "Output strict JSON only with keys: mood, language, genre.\n"
+            "Follow these strict allowed options:\n\n"
+            "1. mood: Choose ONE (Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting)\n"
+            "2. language: Detect primary language (e.g. Hindi, English, Punjabi, Telugu, etc)\n"
+            "3. genre: Choose ONE (Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz)\n"
         )
         
         try:
@@ -817,11 +833,7 @@ async def enrich_metadata(request: Request, song: SongRequest):
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "You are a music metadata classifier. "
-                            "Output strict JSON only with keys: mood, language, genre. "
-                            "Be accurate and specific."
-                        )
+                        "content": "You are a music metadata classifier. Output strict JSON only. Do not add markdown formatting."
                     },
                     {"role": "user", "content": prompt}
                 ],
@@ -844,6 +856,7 @@ async def enrich_metadata(request: Request, song: SongRequest):
             language = "Unknown"
             genre = "Pop"
         
+        # 4. Final Formatted String (4 Parts: Mood;Language;Industry;Genre)
         result = {
             "formatted": f"{mood};{language};{industry};{genre}",
             "mood": mood,
