@@ -1,540 +1,432 @@
-from fastapi import FastAPI, HTTPException, Header, Request, Depends, status
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse # <--- CHANGED
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Dict, Any, Union
+from pydantic import BaseModel
+from typing import List, Optional
 import os
 import json
-import httpx
-import hashlib
-import time
-import logging
-import re
-from datetime import datetime
-from urllib.parse import unquote  # <--- CHANGED: Critical for filename decoding
+import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-import redis
-from contextlib import asynccontextmanager
-import asyncio
 
-# ============================================================================
-# 1. CONFIGURATION & LOGGING
-# ============================================================================
-
+# 1. Load Environment Variables
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+app = FastAPI(title="AudioVibe Backend API", version="6.0.0 (Enhanced-Industry-Detection)")
 
-class Config:
-    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-    SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-    APP_SECRET: str = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
-    UPLOAD_API_KEY: str = os.getenv("UPLOAD_API_KEY", "DONOTTOUCHAPI")
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
-    ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-    
-    # Rate Limits
-    RATE_LIMIT_TRACKS: str = "60/minute"
-    RATE_LIMIT_STREAM: str = "30/minute"
-    RATE_LIMIT_ENRICH: str = "20/minute"
-    RATE_LIMIT_UPLOAD: str = "10/minute"
-    
-    # Timeouts & Expiry
-    EXTERNAL_API_TIMEOUT: int = 8
-    METADATA_CACHE_TTL: int = 3600
-    SHORT_STREAM_EXPIRY: int = 600  # 10 mins
-    LONG_STREAM_EXPIRY: int = 14400 # 4 hours (Allow long sessions)
-    LONG_TRACK_THRESHOLD: int = 900000 
-    
-    # Security
-    # CHANGED: Increased to 3 hours to allow seeking/buffering within a session
-    INTEGRITY_WINDOW: int = 10800 
-    
-    # AI Settings
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
-    DEFAULT_PAGE_SIZE: int = 50
-    MAX_PAGE_SIZE: int = 100
-
-config = Config()
-
-class AppState:
-    supabase: Optional[Client] = None
-    redis_client: Optional[redis.Redis] = None
-    http_client: Optional[httpx.AsyncClient] = None
-    groq_client: Optional[Groq] = None
-
-state = AppState()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 Starting AudioVibe API v17.0 (Redirect Mode)...")
-    try:
-        if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
-            raise RuntimeError("Supabase credentials missing")
-        state.supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
-        logger.info("✅ Supabase connected")
-        
-        if not config.GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY missing")
-        state.groq_client = Groq(api_key=config.GROQ_API_KEY)
-        logger.info("✅ Groq AI connected")
-        
-        try:
-            state.redis_client = redis.from_url(config.REDIS_URL, decode_responses=True, socket_connect_timeout=5)
-            state.redis_client.ping()
-            logger.info("✅ Redis connected")
-        except Exception as e:
-            logger.warning(f"⚠️  Redis unavailable: {e}")
-            state.redis_client = None
-        
-        state.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(config.EXTERNAL_API_TIMEOUT),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
-        )
-        logger.info("✅ All services initialized")
-    except Exception as e:
-        logger.error(f"❌ Startup failed: {e}")
-        raise
-    
-    yield
-    
-    logger.info("👋 Shutting down...")
-    if state.http_client:
-        await state.http_client.aclose()
-    if state.redis_client:
-        state.redis_client.close()
-
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="AudioVibe Secure API", version="17.0.0", lifespan=lifespan)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
+# 2. CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    max_age=3600,
 )
 
-# ============================================================================
-# 2. MODELS
-# ============================================================================
+# 3. Global State for Clients
+supabase: Optional[Client] = None
+groq_client: Optional[Groq] = None
+startup_error: Optional[str] = None
 
+# 4. Safe Initialization (Prevents Crash on Boot)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+try:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase Credentials Missing in Environment Variables")
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY Missing in Environment Variables")
+
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    print("✅ System Online: Clients Initialized")
+
+except Exception as e:
+    startup_error = str(e)
+    print(f"❌ Startup Warning: {e}")
+    print("Server will start in Maintenance Mode (Health Check Only).")
+
+# 5. Config
+EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
+GROQ_MODELS = {"primary": "llama-3.3-70b-versatile"}
+metadata_cache = {}
+
+# 6. Models
 class SongRequest(BaseModel):
-    artist: str = Field(..., min_length=1, max_length=200)
-    title: str = Field(..., min_length=1, max_length=200)
-    album: Optional[str] = Field(None, max_length=200)
-    
-    @field_validator('artist', 'title', 'album')
-    @classmethod
-    def clean_whitespace(cls, v: Optional[str]) -> Optional[str]:
-        return v.strip() if v else v
+    artist: str
+    title: str
+    album: Optional[str] = None
 
 class TrackUpload(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    artist: str = Field(..., min_length=1, max_length=200)
-    album: str = Field(default="Unknown Album", max_length=200)
-    audio_file_url: str = Field(..., min_length=1)
+    title: str
+    artist: str
+    album: str
+    audio_file_url: str
     cover_image_url: Optional[str] = None
-    duration_ms: int = Field(default=0, ge=0)
-    genres: Union[List[str], str] = Field(default_factory=list)
-    tier_required: str = Field(default="free")
-    
-    @field_validator('tier_required')
-    @classmethod
-    def validate_tier(cls, v: str) -> str:
-        valid_tiers = ['free', 'pro', 'ultra_pro']
-        v_lower = v.lower().strip()
-        if v_lower not in valid_tiers:
-            return 'free'
-        return v_lower
-    
-    @field_validator('genres')
-    @classmethod
-    def validate_genres(cls, v: Union[List[str], str]) -> List[str]:
-        if isinstance(v, str):
-            if ',' in v:
-                return [g.strip() for g in v.split(',') if g.strip()]
-            elif ';' in v:
-                return [g.strip() for g in v.split(';') if g.strip()]
-            else:
-                return [v.strip()] if v.strip() else []
-        elif isinstance(v, list):
-            return [str(g).strip() for g in v if str(g).strip()]
-        return []
+    duration_ms: int
+    genres: List[str]
+    tier_required: str = "free"
 
 class PlayRecord(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    track_id: str = Field(..., min_length=1)
-    listen_time_ms: int = Field(..., ge=0)
-    total_duration_ms: int = Field(..., gt=0)
+    user_id: str
+    track_id: str
+    listen_time_ms: int
+    total_duration_ms: int
 
-# ============================================================================
-# 3. SECURITY DEPENDENCIES
-# ============================================================================
-
-def verify_app_integrity(
-    x_app_integrity: str = Header(..., description="SHA256 integrity hash"),
-    x_app_timestamp: str = Header(..., description="Unix timestamp in seconds")
-) -> Dict[str, Any]:
-    try:
-        request_time = int(x_app_timestamp)
-        current_time = int(time.time())
-        time_diff = abs(current_time - request_time)
-        
-        # Enforce window check
-        if time_diff > config.INTEGRITY_WINDOW:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Request expired")
-        
-        expected_hash = hashlib.sha256(
-            f"{config.APP_SECRET}{x_app_timestamp}".encode()
-        ).hexdigest()
-        
-        if x_app_integrity != expected_hash:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Integrity failed")
-        
-        return {"timestamp": request_time, "verified": True}
-        
-    except ValueError:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid timestamp")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Security check failed")
-
-def verify_upload_api_key(x_api_key: str = Header(..., description="Upload API Key")) -> Dict[str, Any]:
-    if not x_api_key or x_api_key != config.UPLOAD_API_KEY:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid API key")
-    return {"authenticated": True}
-
-async def verify_upload_auth(
-    x_api_key: Optional[str] = Header(None),
-    x_app_integrity: Optional[str] = Header(None),
-    x_app_timestamp: Optional[str] = Header(None)
-) -> Dict[str, Any]:
-    if x_api_key:
-        return verify_upload_api_key(x_api_key)
-    if x_app_integrity and x_app_timestamp:
-        return verify_app_integrity(x_app_integrity, x_app_timestamp)
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
-
-# ============================================================================
-# 4. HELPERS
-# ============================================================================
-
+# 7. Helper: Check Backend Readiness
 def ensure_ready():
-    if not state.supabase or not state.groq_client:
-        raise HTTPException(503, "Services unavailable")
+    if startup_error:
+        raise HTTPException(status_code=503, detail=f"Backend Not Ready: {startup_error}")
+    if not supabase or not groq_client:
+        raise HTTPException(status_code=503, detail="Backend Not Ready: Clients not initialized")
 
-def clean_json_response(content: str) -> str:
-    if not content: return "{}"
-    content = re.sub(r'```json\s*', '', content, flags=re.IGNORECASE)
-    content = re.sub(r'```\s*', '', content)
-    return content.strip()
-
-async def get_cached_metadata(key: str) -> Optional[Dict]:
-    if state.redis_client:
-        try:
-            data = state.redis_client.get(f"metadata:{key}")
-            return json.loads(data) if data else None
-        except Exception: pass
-    return None
-
-async def set_cached_metadata(key: str, value: Dict) -> None:
-    if state.redis_client:
-        try:
-            state.redis_client.setex(f"metadata:{key}", config.METADATA_CACHE_TTL, json.dumps(value))
-        except Exception: pass
-
-async def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> Dict:
+# 8. NEW: MusicBrainz API Helper (Free, No API Key Required)
+def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> dict:
+    """
+    Search MusicBrainz for track metadata
+    Returns: dict with 'found', 'release_type', 'labels', 'tags'
+    """
     try:
+        base_url = "https://musicbrainz.org/ws/2/recording/"
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
-        if album and album.lower() not in ["unknown", "unknown album", ""]:
+        if album and album.lower() != "unknown":
             query_parts.append(f'release:"{album}"')
         
-        params = {"query": " AND ".join(query_parts), "fmt": "json", "limit": 2}
-        headers = {"User-Agent": "AudioVibe/17.0 (contact@audiovibe.app)"}
+        query = " AND ".join(query_parts)
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": 3
+        }
+        headers = {"User-Agent": "AudioVibe/6.0 (contact@audiovibe.app)"}
         
-        response = await state.http_client.get(
-            "https://musicbrainz.org/ws/2/recording/", params=params, headers=headers
-        )
+        response = requests.get(base_url, params=params, headers=headers, timeout=5)
         
         if response.status_code == 200:
             data = response.json()
-            if recordings := data.get("recordings"):
-                rec = recordings[0]
+            if data.get("recordings"):
+                recording = data["recordings"][0]
+                releases = recording.get("releases", [])
+                tags = [tag["name"] for tag in recording.get("tags", [])]
+                
+                labels = []
+                release_types = []
+                for release in releases[:3]:
+                    if "label-info" in release:
+                        labels.extend([li.get("label", {}).get("name") for li in release["label-info"]])
+                    release_types.append(release.get("status", ""))
+                
                 return {
                     "found": True,
-                    "tags": [t["name"] for t in rec.get("tags", [])][:5],
-                    "labels": [
-                        l.get("label", {}).get("name") 
-                        for r in rec.get("releases", [])[:2] 
-                        for l in r.get("label-info", []) 
-                        if l.get("label", {}).get("name")
-                    ]
+                    "release_type": release_types[0] if release_types else "Unknown",
+                    "labels": list(set(labels))[:3],
+                    "tags": tags[:5]
                 }
     except Exception as e:
-        logger.error(f"MusicBrainz error: {e}")
-    return {"found": False, "tags": [], "labels": []}
+        print(f"MusicBrainz error: {e}")
+    
+    return {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
 
-async def search_wikipedia(artist: str, album: str) -> Dict:
+# 9. NEW: Wikipedia/Wikidata Helper (Fallback)
+def search_wikipedia(artist: str, album: str) -> dict:
+    """
+    Search Wikipedia for album/movie information
+    Returns: dict with 'is_soundtrack', 'is_film_album', 'industry_hints'
+    """
     try:
-        if not album or album.lower() in ["unknown", "unknown album", ""]:
-            return {"hints": [], "is_soundtrack": False}
+        if not album or album.lower() == "unknown":
+            return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
         
+        search_url = "https://en.wikipedia.org/w/api.php"
         params = {
-            "action": "query", "list": "search",
-            "srsearch": f"{album} {artist} album", "format": "json", "srlimit": 2
+            "action": "query",
+            "list": "search",
+            "srsearch": f"{album} {artist} album soundtrack",
+            "format": "json",
+            "srlimit": 3
         }
         
-        response = await state.http_client.get("https://en.wikipedia.org/w/api.php", params=params)
-        
+        response = requests.get(search_url, params=params, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            hints = []
-            is_soundtrack = False
-            for res in data.get("query", {}).get("search", []):
-                txt = (res.get("snippet", "") + res.get("title", "")).lower()
-                if any(x in txt for x in ["soundtrack", "film", "movie"]): is_soundtrack = True
-                if "bollywood" in txt: hints.append("Bollywood")
-                if "punjabi" in txt: hints.append("Punjabi")
-                if "telugu" in txt or "tollywood" in txt: hints.append("Tollywood")
-                if "tamil" in txt: hints.append("Kollywood")
-            return {"hints": list(set(hints)), "is_soundtrack": is_soundtrack}
-    except Exception: pass
-    return {"hints": [], "is_soundtrack": False}
-
-def detect_industry_enhanced(artist: str, title: str, album: Optional[str], mb_data: Dict, wiki_data: Dict) -> str:
-    artist_lower = artist.lower()
-    if wiki_data.get("hints"): return wiki_data["hints"][0]
-
-    combined_text = f"{artist_lower} {' '.join(mb_data.get('labels', [])).lower()} {' '.join(mb_data.get('tags', [])).lower()}"
+            results = data.get("query", {}).get("search", [])
+            
+            for result in results:
+                snippet = result.get("snippet", "").lower()
+                title = result.get("title", "").lower()
+                
+                is_soundtrack = any(word in snippet or word in title 
+                                   for word in ["soundtrack", "film", "movie", "cinema"])
+                
+                industry_hints = []
+                if any(word in snippet or word in title 
+                      for word in ["bollywood", "hindi film", "mumbai"]):
+                    industry_hints.append("Bollywood")
+                if any(word in snippet or word in title 
+                      for word in ["tollywood", "telugu film", "tamil film", "kollywood"]):
+                    industry_hints.append("Tollywood")
+                if any(word in snippet or word in title 
+                      for word in ["punjabi music", "punjabi album"]):
+                    industry_hints.append("Punjabi")
+                
+                if is_soundtrack or industry_hints:
+                    return {
+                        "is_soundtrack": is_soundtrack,
+                        "is_film_album": is_soundtrack,
+                        "industry_hints": industry_hints
+                    }
+        
+    except Exception as e:
+        print(f"Wikipedia error: {e}")
     
-    if any(x in combined_text for x in ["bollywood", "hindi", "t-series", "zee music", "tips"]): return "Bollywood"
-    if any(x in combined_text for x in ["punjabi", "speed records", "white hill"]): return "Punjabi"
-    if any(x in combined_text for x in ["tollywood", "telugu", "aditya music"]): return "Tollywood"
-    if any(x in combined_text for x in ["atlantic", "columbia", "universal", "interscope"]): return "International"
-    if any(name in artist_lower for name in ["kumar", "singh", "sharma", "khan"]): return "Bollywood"
+    return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
 
+# 10. Enhanced Industry Detection
+def detect_industry_enhanced(artist: str, title: str, album: Optional[str], 
+                            musicbrainz_data: dict, wiki_data: dict) -> str:
+    """
+    Advanced industry detection combining multiple signals
+    """
+    artist_lower = artist.lower()
+    album_lower = album.lower() if album else ""
+    
+    # Check Wikipedia hints first (most reliable for film music)
+    if wiki_data.get("industry_hints"):
+        return wiki_data["industry_hints"][0]
+    
+    # Film/Soundtrack detection
+    is_film_music = (
+        wiki_data.get("is_soundtrack", False) or
+        any(word in album_lower for word in [
+            "soundtrack", "ost", "original score", "film", "movie", 
+            "cinema", "picture"
+        ])
+    )
+    
+    # Indian Film Industry Detection
+    bollywood_indicators = [
+        "bollywood", "hindi", "mumbai", "t-series", "zee music",
+        "sony music india", "yrf", "dharma", "eros", "tips"
+    ]
+    tollywood_indicators = [
+        "tollywood", "telugu", "tamil", "kollywood", "malayalam",
+        "lahari", "aditya music", "mango music", "saregama south"
+    ]
+    punjabi_indicators = [
+        "punjabi", "speed records", "white hill", "saga music"
+    ]
+    
+    # Check MusicBrainz labels
+    labels = " ".join(musicbrainz_data.get("labels", [])).lower()
+    tags = " ".join(musicbrainz_data.get("tags", [])).lower()
+    
+    combined_text = f"{artist_lower} {album_lower} {labels} {tags}"
+    
+    # Film music gets priority
+    if is_film_music:
+        if any(ind in combined_text for ind in bollywood_indicators):
+            return "Bollywood"
+        if any(ind in combined_text for ind in tollywood_indicators):
+            return "Tollywood"
+        if any(ind in combined_text for ind in punjabi_indicators):
+            return "Punjabi"
+    
+    # Non-film Indian music
+    if any(ind in combined_text for ind in bollywood_indicators):
+        # Check if it's independent artist
+        indie_labels = ["independent", "self-released", "indie", "unsigned"]
+        if any(label in labels for label in indie_labels):
+            return "Indie"
+        return "Bollywood"
+    
+    if any(ind in combined_text for ind in tollywood_indicators):
+        return "Tollywood"
+    
+    if any(ind in combined_text for ind in punjabi_indicators):
+        return "Punjabi"
+    
+    # Western/International detection
+    western_indicators = [
+        "atlantic", "columbia", "universal", "warner", "epic", "interscope",
+        "capitol", "rca", "def jam", "republic"
+    ]
+    if any(ind in labels for ind in western_indicators):
+        return "International"
+    
+    # Default to Indie for unknown/independent releases
+    if "independent" in labels or "self" in labels:
+        return "Indie"
+    
+    # Last resort: check language/region
+    indian_names = ["kumar", "singh", "sharma", "khan", "rao", "reddy", "iyer"]
+    if any(name in artist_lower for name in indian_names):
+        return "Indie"
+    
     return "International"
 
-# ============================================================================
-# 5. ENDPOINTS
-# ============================================================================
-
+# 11. Endpoints
 @app.get("/")
-async def root():
-    return {"status": "online", "version": "17.0.0", "mode": "redirect_stream_v2"}
+def read_root():
+    if startup_error:
+        return {"status": "Maintenance Mode", "error": startup_error}
+    return {"status": "Active", "version": "6.0.0"}
 
 @app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+def health_check():
+    return {
+        "status": "unhealthy" if startup_error else "healthy",
+        "startup_error": startup_error,
+        "env_vars": {
+            "GROQ_KEY_SET": bool(GROQ_API_KEY),
+            "SUPABASE_URL_SET": bool(SUPABASE_URL),
+            "SUPABASE_KEY_SET": bool(SUPABASE_SERVICE_ROLE_KEY)
+        }
+    }
 
-@app.get("/tracks/metadata", dependencies=[Depends(verify_app_integrity)])
-@limiter.limit(config.RATE_LIMIT_TRACKS)
-async def get_tracks_metadata(request: Request, page: int = 1, limit: int = 50, search: Optional[str] = None):
+@app.get("/tracks")
+async def get_tracks(x_app_integrity: Optional[str] = Header(None)):
     ensure_ready()
     try:
-        page = max(1, int(page))
-        limit = min(max(1, int(limit)), config.MAX_PAGE_SIZE)
-        start = (page - 1) * limit
-        end = start + limit - 1
-        
-        try:
-            # Attempt 1: Album-Based Pagination
-            album_query = state.supabase.table("unique_albums").select("album, artist", count="exact")
-            if search and search.strip():
-                term = f"%{search.strip()}%"
-                album_query = album_query.or_(f"album.ilike.{term},artist.ilike.{term}")
-            
-            album_query = album_query.order("created_at", desc=True).range(start, end)
-            albums_response = album_query.execute()
-            
-            if not albums_response.data:
-                return {"status": "success", "page": page, "total_albums": 0, "tracks": []}
-
-            album_names = [album['album'] for album in albums_response.data]
-            tracks_query = state.supabase.table("music_tracks").select(
-                "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at"
-            ).in_("album", album_names).order("created_at", desc=True)
-            
-            tracks_response = tracks_query.execute()
-            return {"status": "success", "page": page, "total_albums": albums_response.count, "tracks": tracks_response.data, "mode": "album_grouped"}
-
-        except Exception:
-            # Attempt 2: Standard Pagination Fallback
-            query = state.supabase.table("music_tracks").select(
-                "id, title, artist, album, cover_image_url, duration_ms, genres, tier_required, created_at", count="exact"
-            )
-            if search and search.strip():
-                term = f"%{search.strip()}%"
-                query = query.or_(f"title.ilike.{term},artist.ilike.{term},album.ilike.{term}")
-            
-            query = query.order("created_at", desc=True).range(start, end)
-            response = query.execute()
-            return {"status": "success", "page": page, "total_count": response.count, "tracks": response.data, "mode": "standard"}
-            
+        response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
+        return response.data
     except Exception as e:
-        logger.error(f"Metadata error: {e}")
-        raise HTTPException(500, "Failed to fetch tracks")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/tracks/stream/{track_id}", dependencies=[Depends(verify_app_integrity)])
-@limiter.limit(config.RATE_LIMIT_STREAM)
-async def get_stream_url(request: Request, track_id: str):
-    """
-    PERMANENT LINK REDIRECT
-    1. Validates integrity headers.
-    2. Decodes filename (fixes Source Error).
-    3. Redirects (307) to the temporary signed URL.
-    """
+@app.post("/tracks")
+async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(None)):
     ensure_ready()
     try:
-        response = state.supabase.table("music_tracks").select(
-            "audio_file_url, duration_ms, title"
-        ).eq("id", track_id).execute()
-        
-        if not response.data:
-            raise HTTPException(404, "Track not found")
-        
-        track = response.data[0]
-        duration = track.get('duration_ms', 0)
-        is_long = duration > config.LONG_TRACK_THRESHOLD
-        expiry = config.LONG_STREAM_EXPIRY if is_long else config.SHORT_STREAM_EXPIRY
-        
-        raw_url = track['audio_file_url']
-        if "/music_files/" in raw_url:
-            path = raw_url.split("/music_files/")[1]
-        else:
-            path = raw_url
-            
-        # ✅ CRITICAL FIX: Decode path (e.g., 'Song%20Name.mp3' -> 'Song Name.mp3')
-        decoded_path = unquote(path)
-            
-        safe_title = re.sub(r'[^a-zA-Z0-9]', '_', track.get('title', 'track'))
-        download_filename = f"{safe_title}.mp3"
-
-        signed = state.supabase.storage.from_("music_files").create_signed_url(
-            decoded_path, 
-            expiry, 
-            options={'download': download_filename}
-        )
-        
-        # ✅ CHANGED: Return Redirect instead of JSON
-        return RedirectResponse(url=signed["signedURL"], status_code=307)
-
+        data = track.dict()
+        if not data.get('tier_required'): 
+            data['tier_required'] = 'free'
+        response = supabase.table("music_tracks").insert(data).execute()
+        return {"status": "success", "data": response.data}
     except Exception as e:
-        logger.error(f"Stream error: {e}")
-        raise HTTPException(500, "Failed to generate stream URL")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/tracks", dependencies=[Depends(verify_upload_auth)])
-@limiter.limit(config.RATE_LIMIT_UPLOAD)
-async def add_track(request: Request, track: TrackUpload):
+@app.post("/record-play")
+async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(None)):
     ensure_ready()
     try:
-        data = track.model_dump()
-        response = state.supabase.table("music_tracks").insert(data).execute()
-        if response.data:
-            return {"status": "success", "data": response.data[0]}
-        raise Exception("Database insert failed")
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(500, "Upload failed")
-
-@app.post("/record-play", dependencies=[Depends(verify_app_integrity)])
-async def record_play(stat: PlayRecord):
-    ensure_ready()
-    try:
-        rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
-        state.supabase.rpc('upsert_listening_stat', {
-            'p_user_id': stat.user_id, 'p_track_id': stat.track_id,
-            'p_listen_time_ms': stat.listen_time_ms, 'p_completion_rate': rate
+        completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
+        supabase.rpc('upsert_listening_stat', {
+            'p_user_id': stat.user_id, 
+            'p_track_id': stat.track_id, 
+            'p_listen_time_ms': stat.listen_time_ms, 
+            'p_completion_rate': completion_rate
         }).execute()
-        return {"status": "success"}
-    except Exception as e:
-        logger.error(f"Record play error: {e}")
+        return {"status": "recorded"}
+    except Exception:
         return {"status": "error"}
 
-@app.post("/enrich-metadata", dependencies=[Depends(verify_app_integrity)])
-@limiter.limit(config.RATE_LIMIT_ENRICH)
-async def enrich_metadata(request: Request, song: SongRequest):
+@app.post("/enrich-metadata")
+async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = Header(None)):
     ensure_ready()
     
-    cache_key = f"v5:{song.artist}:{song.title}:{song.album or ''}".lower()
-    if cached := await get_cached_metadata(cache_key): return cached
+    clean_title = song.title.strip()
+    clean_artist = song.artist.strip()
+    clean_album = song.album.strip() if song.album else ""
     
+    cache_key = f"{clean_artist.lower()}:{clean_title.lower()}:{clean_album.lower()}"
+    if cache_key in metadata_cache:
+        print(f"💾 Cache hit: {cache_key}")
+        return metadata_cache[cache_key]
+
+    print(f"🔍 Analyzing: '{clean_title}' by '{clean_artist}' from '{clean_album}'")
+    
+    # Step 1: Search external sources
+    musicbrainz_data = search_musicbrainz(clean_artist, clean_title, clean_album)
+    wiki_data = search_wikipedia(clean_artist, clean_album)
+    
+    print(f"📊 MusicBrainz: {musicbrainz_data}")
+    print(f"📖 Wikipedia: {wiki_data}")
+    
+    # Step 2: Enhanced industry detection
+    industry = detect_industry_enhanced(
+        clean_artist, clean_title, clean_album,
+        musicbrainz_data, wiki_data
+    )
+    
+    print(f"🏭 Detected Industry: {industry}")
+    
+    # Step 3: Build context for Groq
+    context_info = f"Artist: {clean_artist}, Title: {clean_title}"
+    if clean_album and clean_album.lower() != "unknown":
+        context_info += f", Album: {clean_album}"
+    
+    if musicbrainz_data.get("found"):
+        context_info += f", Labels: {', '.join(musicbrainz_data['labels'][:2])}"
+        context_info += f", Tags: {', '.join(musicbrainz_data['tags'][:3])}"
+    
+    if wiki_data.get("is_film_album"):
+        context_info += ", Type: Film Soundtrack"
+    
+    # Step 4: Groq Classification (Mood, Language, Genre)
+    prompt = (
+        f"Analyze: {context_info}\n"
+        f"Detected Industry: {industry}\n\n"
+        
+        "TASK 1: MOOD\n"
+        "   Options: Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting\n\n"
+        
+        "TASK 2: LANGUAGE\n"
+        "   Detect primary language (Hindi, Telugu, Tamil, Punjabi, English, etc.)\n\n"
+        
+        "TASK 3: GENRE (Simple categories)\n"
+        "   Options: Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz\n\n"
+        
+        "OUTPUT JSON:\n"
+        "{\n"
+        '  "mood": "...",\n'
+        '  "language": "...",\n'
+        '  "genre": "..."\n'
+        "}"
+    )
+
     try:
-        mb_task = search_musicbrainz(song.artist, song.title, song.album)
-        wiki_task = search_wikipedia(song.artist, song.album or "")
-        mb_data, wiki_data = await asyncio.gather(mb_task, wiki_task, return_exceptions=True)
-        
-        if isinstance(mb_data, Exception): mb_data = {"found": False}
-        if isinstance(wiki_data, Exception): wiki_data = {"hints": []}
-        
-        industry = detect_industry_enhanced(song.artist, song.title, song.album, mb_data, wiki_data)
-
-        external_context = f"Detected Industry: {industry}. "
-        if mb_data.get("found"): external_context += f"Tags: {', '.join(mb_data.get('tags', []))}. "
-        if wiki_data.get("hints"): external_context += f"Keywords: {', '.join(wiki_data['hints'])}."
-
-        prompt = f"""
-        Analyze song: "{song.title}" by "{song.artist}" (Album: {song.album}).
-        Context: {external_context}
-        Task: Return JSON.
-        1. "genre": Choose ONE [Pop, Hip-Hop/Rap, Bollywood, Punjabi Pop, R&B/Soul, Alternative, Rock, Indian Pop, Dance, Electronic, Singer/Songwriter, Classical, Jazz, K-Pop, Latin, Metal, Country, Blues, Devotional, Reggae]
-        2. "mood": Choose ONE [Uplifting, Chill, Energetic, Melancholic, Romantic, Aggressive, Focus, Party]
-        3. "language": Detect primary language.
-        JSON OUTPUT ONLY:
-        """
-
-        chat_completion = state.groq_client.chat.completions.create(
+        chat_completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a music taxonomist. Output strict JSON."},
+                {"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            model=config.GROQ_MODEL,
-            temperature=0.2, max_tokens=150, response_format={"type": "json_object"}
+            model=GROQ_MODELS["primary"],
+            temperature=0.1,
+            max_tokens=150,
+            response_format={"type": "json_object"}
         )
-        
-        raw_content = chat_completion.choices[0].message.content.strip()
-        cleaned_content = clean_json_response(raw_content)
-        ai_data = json.loads(cleaned_content)
-        
-        genre = ai_data.get("genre", "Pop").strip()
-        valid_genres = ["Pop", "Hip-Hop/Rap", "Bollywood", "Punjabi Pop", "R&B/Soul", "Alternative", "Rock", "Indian Pop", "Dance", "Electronic", "Singer/Songwriter", "Classical", "Jazz", "K-Pop", "Latin", "Metal", "Country", "Blues", "Devotional"]
-        
-        if genre not in valid_genres:
-            if industry == "Bollywood": genre = "Bollywood"
-            elif industry == "Punjabi": genre = "Punjabi Pop"
-            elif industry == "Tollywood": genre = "Indian Pop"
-            else: genre = "Pop"
 
-        result = {
-            "mood": ai_data.get("mood", "Neutral").title(),
-            "language": ai_data.get("language", "Unknown").title(),
-            "industry": industry,
-            "genre": genre,
-            "formatted": f"{ai_data.get('mood')};{genre}",
-            "is_cached": False
-        }
+        content = chat_completion.choices[0].message.content.strip()
+        data = json.loads(content)
         
-        await set_cached_metadata(cache_key, {**result, "is_cached": True})
-        return result
+        mood = data.get("mood", "Neutral").title()
+        language = data.get("language", "Unknown").title()
+        genre = data.get("genre", "Pop").title()
 
     except Exception as e:
-        logger.error(f"Enrichment failed: {e}")
-        return {"mood": "Neutral", "language": "Unknown", "industry": "Unknown", "genre": "Pop", "formatted": "Neutral;Pop", "error": True}
+        print(f"⚠️ Groq error: {e}")
+        mood, language, genre = "Neutral", "Unknown", "Pop"
+
+    # Final result with metadata sources info
+    result = {
+        "formatted": f"{mood};{language};{industry};{genre}",
+        "mood": mood,
+        "language": language,
+        "industry": industry,  # Enhanced with web search
+        "genre": genre,
+        "sources_used": {
+            "musicbrainz": musicbrainz_data.get("found", False),
+            "wikipedia": bool(wiki_data.get("industry_hints")),
+            "labels_found": len(musicbrainz_data.get("labels", [])),
+            "is_soundtrack": wiki_data.get("is_film_album", False)
+        }
+    }
+    
+    metadata_cache[cache_key] = result
+    print(f"✅ Result: {result['formatted']}")
+    
+    return result
 
 if __name__ == "__main__":
     import uvicorn
