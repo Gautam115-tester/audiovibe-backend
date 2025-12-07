@@ -7,3 +7,4 @@ groq
 slowapi
 redis
 httpx
+requests
