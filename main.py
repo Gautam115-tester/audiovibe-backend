@@ -3,12 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
+from collections import defaultdict
 import hashlib
 import os
 import json
 import requests
 import time
-from collections import defaultdict
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
@@ -18,10 +18,10 @@ from groq import Groq
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure Backend API", version="7.0.0 (Enhanced-Security-Industry-Detection)")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.0-Enhanced")
 
 # ============================================================
-# 2. SECURITY CONFIGURATION
+# 🔐 SECURITY CONFIGURATION
 # ============================================================
 
 # ✅ MUST MATCH Flutter's SecurityService._appSecret
@@ -35,19 +35,14 @@ RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX_REQUESTS = 100  # requests per window per device
 rate_limit_storage = defaultdict(list)
 
-# Legacy integrity header support (for gradual migration)
-EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
+# ============================================================
+# 2. INITIALIZE CLIENTS (SUPABASE & GROQ)
+# ============================================================
 
-# ============================================================
-# 3. GLOBAL STATE FOR CLIENTS
-# ============================================================
 supabase: Optional[Client] = None
 groq_client: Optional[Groq] = None
 startup_error: Optional[str] = None
 
-# ============================================================
-# 4. SAFE INITIALIZATION (Prevents Crash on Boot)
-# ============================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -68,19 +63,46 @@ except Exception as e:
     print("Server will start in Maintenance Mode (Health Check Only).")
 
 # ============================================================
-# 5. CONFIG
+# 3. CONFIGURATION
 # ============================================================
+
+EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
 GROQ_MODELS = {"primary": "llama-3.3-70b-versatile"}
 metadata_cache = {}
 
 # ============================================================
-# 6. MIDDLEWARE: Security Validation
+# 4. PYDANTIC MODELS
+# ============================================================
+
+class SongRequest(BaseModel):
+    artist: str
+    title: str
+    album: Optional[str] = None
+
+class TrackUpload(BaseModel):
+    title: str
+    artist: str
+    album: str
+    audio_file_url: str
+    cover_image_url: Optional[str] = None
+    duration_ms: int
+    genres: List[str]
+    tier_required: str = "free"
+
+class PlayRecord(BaseModel):
+    user_id: str
+    track_id: str
+    listen_time_ms: int
+    total_duration_ms: int
+
+# ============================================================
+# 🛡️ MIDDLEWARE: Security Validation
 # ============================================================
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    # Skip security for health check and root
-    if request.url.path in ["/health", "/"]:
+    # Skip security for health check
+    if request.url.path == "/health":
         return await call_next(request)
 
     # 1. Extract Headers
@@ -156,14 +178,15 @@ async def security_middleware(request: Request, call_next):
     return response
 
 # ============================================================
-# 7. CORS (Restrict to Your Domain ONLY)
+# 📡 CORS CONFIGURATION
 # ============================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://yourdomain.com",  # ⚠️ Replace with your actual domain
         "http://localhost:*",  # Development only - REMOVE in production
-        "*"  # Keep for development, restrict in production
+        "*"  # Fallback for development
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -171,35 +194,11 @@ app.add_middleware(
 )
 
 # ============================================================
-# 8. MODELS
-# ============================================================
-class SongRequest(BaseModel):
-    artist: str
-    title: str
-    album: Optional[str] = None
-
-class TrackUpload(BaseModel):
-    title: str
-    artist: str
-    album: str
-    audio_file_url: str
-    cover_image_url: Optional[str] = None
-    duration_ms: int
-    genres: List[str]
-    tier_required: str = "free"
-
-class PlayRecord(BaseModel):
-    user_id: str
-    track_id: str
-    listen_time_ms: int
-    total_duration_ms: int
-
-# ============================================================
-# 9. HELPER FUNCTIONS
+# 5. HELPER FUNCTIONS
 # ============================================================
 
 def ensure_ready():
-    """Check if backend is ready to serve requests"""
+    """Check if backend is ready to process requests"""
     if startup_error:
         raise HTTPException(status_code=503, detail=f"Backend Not Ready: {startup_error}")
     if not supabase or not groq_client:
@@ -387,18 +386,17 @@ def detect_industry_enhanced(artist: str, title: str, album: Optional[str],
     return "International"
 
 # ============================================================
-# 10. ENDPOINTS
+# 📌 API ENDPOINTS
 # ============================================================
 
 @app.get("/")
 def read_root():
-    """Public endpoint - no security required"""
     if startup_error:
         return {"status": "Maintenance Mode", "error": startup_error}
     return {
         "status": "Active",
-        "version": "7.0.0",
-        "message": "Secure API - Authorized clients only"
+        "version": "7.0.0-Enhanced",
+        "message": "Secure API with Enhanced Metadata Detection"
     }
 
 @app.get("/health")
@@ -411,7 +409,8 @@ def health_check():
         "env_vars": {
             "GROQ_KEY_SET": bool(GROQ_API_KEY),
             "SUPABASE_URL_SET": bool(SUPABASE_URL),
-            "SUPABASE_KEY_SET": bool(SUPABASE_SERVICE_ROLE_KEY)
+            "SUPABASE_KEY_SET": bool(SUPABASE_SERVICE_ROLE_KEY),
+            "INTEGRITY_SECRET_SET": bool(APP_INTEGRITY_SECRET)
         }
     }
 
@@ -422,10 +421,7 @@ async def get_tracks(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
-    """
-    Get all tracks (Protected by middleware)
-    Security headers validated automatically by middleware
-    """
+    """Get all tracks (secured by middleware)"""
     ensure_ready()
     try:
         response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
@@ -441,9 +437,7 @@ async def add_track(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
-    """
-    Add new track (Protected by middleware)
-    """
+    """Add new track (secured by middleware)"""
     ensure_ready()
     try:
         data = track.dict()
@@ -462,9 +456,7 @@ async def record_play(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
-    """
-    Record play statistics (Protected by middleware)
-    """
+    """Record play statistics (secured by middleware)"""
     ensure_ready()
     try:
         completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
@@ -487,7 +479,7 @@ async def enrich_metadata(
     x_app_version: str = Header(...)
 ):
     """
-    Enrich song metadata with AI analysis (Protected by middleware)
+    Enhanced metadata enrichment with industry detection (secured by middleware)
     """
     ensure_ready()
     
@@ -574,18 +566,16 @@ async def enrich_metadata(
         print(f"⚠️ Groq error: {e}")
         mood, language, genre = "Neutral", "Unknown", "Pop"
 
-    # Final result with metadata sources info
+    # Final result
     result = {
         "formatted": f"{mood};{language};{industry};{genre}",
         "mood": mood,
         "language": language,
         "industry": industry,
         "genre": genre,
-        "sources_used": {
-            "musicbrainz": musicbrainz_data.get("found", False),
-            "wikipedia": bool(wiki_data.get("industry_hints")),
-            "labels_found": len(musicbrainz_data.get("labels", [])),
-            "is_soundtrack": wiki_data.get("is_film_album", False)
+        "metadata_sources": {
+            "musicbrainz_found": musicbrainz_data.get("found", False),
+            "wikipedia_checked": bool(wiki_data.get("industry_hints"))
         }
     }
     
@@ -595,8 +585,9 @@ async def enrich_metadata(
     return result
 
 # ============================================================
-# 11. RUN SERVER
+# 🚀 APPLICATION ENTRY POINT
 # ============================================================
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
