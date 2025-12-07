@@ -1,34 +1,53 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+from datetime import datetime, timedelta
+import hashlib
 import os
 import json
 import requests
+import time
+from collections import defaultdict
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
 
-# 1. Load Environment Variables
+# ============================================================
+# 1. LOAD ENVIRONMENT VARIABLES
+# ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Backend API", version="6.0.0 (Enhanced-Industry-Detection)")
+app = FastAPI(title="AudioVibe Secure Backend API", version="7.0.0 (Enhanced-Security-Industry-Detection)")
 
-# 2. CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================
+# 2. SECURITY CONFIGURATION
+# ============================================================
 
-# 3. Global State for Clients
+# ✅ MUST MATCH Flutter's SecurityService._appSecret
+APP_INTEGRITY_SECRET = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
+
+# ⚠️ ALLOWED APP VERSIONS (Update when you release new versions)
+ALLOWED_APP_VERSIONS = ["1.0.0", "1.0.1", "1.1.0"]
+
+# 🚫 Rate Limiting Configuration
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 100  # requests per window per device
+rate_limit_storage = defaultdict(list)
+
+# Legacy integrity header support (for gradual migration)
+EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
+
+# ============================================================
+# 3. GLOBAL STATE FOR CLIENTS
+# ============================================================
 supabase: Optional[Client] = None
 groq_client: Optional[Groq] = None
 startup_error: Optional[str] = None
 
-# 4. Safe Initialization (Prevents Crash on Boot)
+# ============================================================
+# 4. SAFE INITIALIZATION (Prevents Crash on Boot)
+# ============================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -48,12 +67,112 @@ except Exception as e:
     print(f"❌ Startup Warning: {e}")
     print("Server will start in Maintenance Mode (Health Check Only).")
 
-# 5. Config
-EXPECTED_INTEGRITY_HEADER = 'clean-device-v1'
+# ============================================================
+# 5. CONFIG
+# ============================================================
 GROQ_MODELS = {"primary": "llama-3.3-70b-versatile"}
 metadata_cache = {}
 
-# 6. Models
+# ============================================================
+# 6. MIDDLEWARE: Security Validation
+# ============================================================
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Skip security for health check and root
+    if request.url.path in ["/health", "/"]:
+        return await call_next(request)
+
+    # 1. Extract Headers
+    timestamp = request.headers.get("x-app-timestamp")
+    integrity_hash = request.headers.get("x-app-integrity")
+    device_id = request.headers.get("x-device-id")
+    app_version = request.headers.get("x-app-version")
+
+    # 2. Validate Presence
+    if not all([timestamp, integrity_hash, device_id, app_version]):
+        raise HTTPException(
+            status_code=403,
+            detail="Missing security headers"
+        )
+
+    # 3. Validate App Version
+    if app_version not in ALLOWED_APP_VERSIONS:
+        raise HTTPException(
+            status_code=403,
+            detail="Unsupported app version. Please update."
+        )
+
+    # 4. Validate Timestamp (Prevent Replay Attacks)
+    try:
+        request_time = int(timestamp)
+        current_time = int(time.time())
+        time_diff = abs(current_time - request_time)
+
+        # Reject requests older than 5 minutes or from the future
+        if time_diff > 300:
+            raise HTTPException(
+                status_code=403,
+                detail="Request expired or invalid timestamp"
+            )
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid timestamp format")
+
+    # 5. Validate Integrity Hash
+    payload = f"{APP_INTEGRITY_SECRET}{timestamp}{device_id}{app_version}"
+    expected_hash = hashlib.sha256(payload.encode()).hexdigest()
+
+    if integrity_hash != expected_hash:
+        print(f"❌ Hash Mismatch!")
+        print(f"   Expected: {expected_hash}")
+        print(f"   Received: {integrity_hash}")
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid security signature"
+        )
+
+    # 6. Rate Limiting (Per Device)
+    current_time = time.time()
+    device_requests = rate_limit_storage[device_id]
+
+    # Clean old requests outside the window
+    device_requests[:] = [
+        req_time for req_time in device_requests
+        if current_time - req_time < RATE_LIMIT_WINDOW
+    ]
+
+    # Check if limit exceeded
+    if len(device_requests) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Please try again later."
+        )
+
+    # Record this request
+    device_requests.append(current_time)
+
+    # ✅ All checks passed - proceed
+    response = await call_next(request)
+    return response
+
+# ============================================================
+# 7. CORS (Restrict to Your Domain ONLY)
+# ============================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://yourdomain.com",  # ⚠️ Replace with your actual domain
+        "http://localhost:*",  # Development only - REMOVE in production
+        "*"  # Keep for development, restrict in production
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================
+# 8. MODELS
+# ============================================================
 class SongRequest(BaseModel):
     artist: str
     title: str
@@ -75,14 +194,17 @@ class PlayRecord(BaseModel):
     listen_time_ms: int
     total_duration_ms: int
 
-# 7. Helper: Check Backend Readiness
+# ============================================================
+# 9. HELPER FUNCTIONS
+# ============================================================
+
 def ensure_ready():
+    """Check if backend is ready to serve requests"""
     if startup_error:
         raise HTTPException(status_code=503, detail=f"Backend Not Ready: {startup_error}")
     if not supabase or not groq_client:
         raise HTTPException(status_code=503, detail="Backend Not Ready: Clients not initialized")
 
-# 8. NEW: MusicBrainz API Helper (Free, No API Key Required)
 def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> dict:
     """
     Search MusicBrainz for track metadata
@@ -100,7 +222,7 @@ def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> 
             "fmt": "json",
             "limit": 3
         }
-        headers = {"User-Agent": "AudioVibe/6.0 (contact@audiovibe.app)"}
+        headers = {"User-Agent": "AudioVibe/7.0 (contact@audiovibe.app)"}
         
         response = requests.get(base_url, params=params, headers=headers, timeout=5)
         
@@ -129,7 +251,6 @@ def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> 
     
     return {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
 
-# 9. NEW: Wikipedia/Wikidata Helper (Fallback)
 def search_wikipedia(artist: str, album: str) -> dict:
     """
     Search Wikipedia for album/movie information
@@ -183,7 +304,6 @@ def search_wikipedia(artist: str, album: str) -> dict:
     
     return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
 
-# 10. Enhanced Industry Detection
 def detect_industry_enhanced(artist: str, title: str, album: Optional[str], 
                             musicbrainz_data: dict, wiki_data: dict) -> str:
     """
@@ -266,17 +386,27 @@ def detect_industry_enhanced(artist: str, title: str, album: Optional[str],
     
     return "International"
 
-# 11. Endpoints
+# ============================================================
+# 10. ENDPOINTS
+# ============================================================
+
 @app.get("/")
 def read_root():
+    """Public endpoint - no security required"""
     if startup_error:
         return {"status": "Maintenance Mode", "error": startup_error}
-    return {"status": "Active", "version": "6.0.0"}
+    return {
+        "status": "Active",
+        "version": "7.0.0",
+        "message": "Secure API - Authorized clients only"
+    }
 
 @app.get("/health")
 def health_check():
+    """Public endpoint for monitoring (no auth required)"""
     return {
         "status": "unhealthy" if startup_error else "healthy",
+        "timestamp": int(time.time()),
         "startup_error": startup_error,
         "env_vars": {
             "GROQ_KEY_SET": bool(GROQ_API_KEY),
@@ -286,7 +416,16 @@ def health_check():
     }
 
 @app.get("/tracks")
-async def get_tracks(x_app_integrity: Optional[str] = Header(None)):
+async def get_tracks(
+    x_app_timestamp: str = Header(...),
+    x_app_integrity: str = Header(...),
+    x_device_id: str = Header(...),
+    x_app_version: str = Header(...)
+):
+    """
+    Get all tracks (Protected by middleware)
+    Security headers validated automatically by middleware
+    """
     ensure_ready()
     try:
         response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
@@ -295,7 +434,16 @@ async def get_tracks(x_app_integrity: Optional[str] = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/tracks")
-async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(None)):
+async def add_track(
+    track: TrackUpload,
+    x_app_timestamp: str = Header(...),
+    x_app_integrity: str = Header(...),
+    x_device_id: str = Header(...),
+    x_app_version: str = Header(...)
+):
+    """
+    Add new track (Protected by middleware)
+    """
     ensure_ready()
     try:
         data = track.dict()
@@ -307,7 +455,16 @@ async def add_track(track: TrackUpload, x_app_integrity: Optional[str] = Header(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/record-play")
-async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(None)):
+async def record_play(
+    stat: PlayRecord,
+    x_app_timestamp: str = Header(...),
+    x_app_integrity: str = Header(...),
+    x_device_id: str = Header(...),
+    x_app_version: str = Header(...)
+):
+    """
+    Record play statistics (Protected by middleware)
+    """
     ensure_ready()
     try:
         completion_rate = min(1.0, stat.listen_time_ms / stat.total_duration_ms) if stat.total_duration_ms > 0 else 0
@@ -322,7 +479,16 @@ async def record_play(stat: PlayRecord, x_app_integrity: Optional[str] = Header(
         return {"status": "error"}
 
 @app.post("/enrich-metadata")
-async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = Header(None)):
+async def enrich_metadata(
+    song: SongRequest,
+    x_app_timestamp: str = Header(...),
+    x_app_integrity: str = Header(...),
+    x_device_id: str = Header(...),
+    x_app_version: str = Header(...)
+):
+    """
+    Enrich song metadata with AI analysis (Protected by middleware)
+    """
     ensure_ready()
     
     clean_title = song.title.strip()
@@ -413,7 +579,7 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
         "formatted": f"{mood};{language};{industry};{genre}",
         "mood": mood,
         "language": language,
-        "industry": industry,  # Enhanced with web search
+        "industry": industry,
         "genre": genre,
         "sources_used": {
             "musicbrainz": musicbrainz_data.get("found", False),
@@ -428,6 +594,9 @@ async def enrich_metadata(song: SongRequest, x_app_integrity: Optional[str] = He
     
     return result
 
+# ============================================================
+# 11. RUN SERVER
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
