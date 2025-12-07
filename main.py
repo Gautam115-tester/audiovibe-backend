@@ -18,7 +18,7 @@ from groq import Groq
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure API", version="7.0.0-Enhanced")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.1-Fixed")
 
 # ============================================================
 # 🔐 SECURITY CONFIGURATION
@@ -102,7 +102,7 @@ class PlayRecord(BaseModel):
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     # Skip security for health check
-    if request.url.path == "/health":
+    if request.url.path == "/health" or request.url.path == "/":
         return await call_next(request)
 
     # 1. Extract Headers
@@ -395,7 +395,7 @@ def read_root():
         return {"status": "Maintenance Mode", "error": startup_error}
     return {
         "status": "Active",
-        "version": "7.0.0-Enhanced",
+        "version": "7.0.1-Fixed",
         "message": "Secure API with Enhanced Metadata Detection"
     }
 
@@ -479,7 +479,7 @@ async def enrich_metadata(
     x_app_version: str = Header(...)
 ):
     """
-    Enhanced metadata enrichment with industry detection (secured by middleware)
+    Enhanced metadata enrichment with Markdown cleaning and Debugging
     """
     ensure_ready()
     
@@ -492,22 +492,17 @@ async def enrich_metadata(
         print(f"💾 Cache hit: {cache_key}")
         return metadata_cache[cache_key]
 
-    print(f"🔍 Analyzing: '{clean_title}' by '{clean_artist}' from '{clean_album}'")
+    print(f"🔍 Analyzing: '{clean_title}' by '{clean_artist}'")
     
     # Step 1: Search external sources
     musicbrainz_data = search_musicbrainz(clean_artist, clean_title, clean_album)
     wiki_data = search_wikipedia(clean_artist, clean_album)
-    
-    print(f"📊 MusicBrainz: {musicbrainz_data}")
-    print(f"📖 Wikipedia: {wiki_data}")
     
     # Step 2: Enhanced industry detection
     industry = detect_industry_enhanced(
         clean_artist, clean_title, clean_album,
         musicbrainz_data, wiki_data
     )
-    
-    print(f"🏭 Detected Industry: {industry}")
     
     # Step 3: Build context for Groq
     context_info = f"Artist: {clean_artist}, Title: {clean_title}"
@@ -518,10 +513,7 @@ async def enrich_metadata(
         context_info += f", Labels: {', '.join(musicbrainz_data['labels'][:2])}"
         context_info += f", Tags: {', '.join(musicbrainz_data['tags'][:3])}"
     
-    if wiki_data.get("is_film_album"):
-        context_info += ", Type: Film Soundtrack"
-    
-    # Step 4: Groq Classification (Mood, Language, Genre)
+    # Step 4: Groq Classification
     prompt = (
         f"Analyze: {context_info}\n"
         f"Detected Industry: {industry}\n\n"
@@ -532,10 +524,10 @@ async def enrich_metadata(
         "TASK 2: LANGUAGE\n"
         "   Detect primary language (Hindi, Telugu, Tamil, Punjabi, English, etc.)\n\n"
         
-        "TASK 3: GENRE (Simple categories)\n"
+        "TASK 3: GENRE\n"
         "   Options: Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz\n\n"
         
-        "OUTPUT JSON:\n"
+        "OUTPUT: Return ONLY raw JSON. Do not use markdown code blocks.\n"
         "{\n"
         '  "mood": "...",\n'
         '  "language": "...",\n'
@@ -546,16 +538,27 @@ async def enrich_metadata(
     try:
         chat_completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
+                {"role": "system", "content": "You are a music metadata classifier. Return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
             model=GROQ_MODELS["primary"],
             temperature=0.1,
             max_tokens=150,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"} 
         )
 
         content = chat_completion.choices[0].message.content.strip()
+        
+        # 🛠️ DEBUGGING: Print raw response to console
+        print(f"🤖 Raw AI Response: {content}")
+
+        # 🛠️ FIX: Strip Markdown Code Blocks
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:] # Remove 'json'
+            content = content.strip()
+
         data = json.loads(content)
         
         mood = data.get("mood", "Neutral").title()
@@ -563,7 +566,7 @@ async def enrich_metadata(
         genre = data.get("genre", "Pop").title()
 
     except Exception as e:
-        print(f"⚠️ Groq error: {e}")
+        print(f"⚠️ Groq Processing Error: {e}")
         mood, language, genre = "Neutral", "Unknown", "Pop"
 
     # Final result
