@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
 import hashlib
@@ -9,8 +9,6 @@ import os
 import json
 import requests
 import time
-import re
-from functools import lru_cache
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
@@ -20,7 +18,7 @@ from groq import Groq
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure API", version="8.0.0-Professional-Secure")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.0-Enhanced")
 
 # ============================================================
 # 🔐 SECURITY CONFIGURATION
@@ -206,259 +204,71 @@ def ensure_ready():
     if not supabase or not groq_client:
         raise HTTPException(status_code=503, detail="Backend Not Ready: Clients not initialized")
 
-# ============================================================================
-# 6. COMPREHENSIVE INDUSTRY DATABASE (2024-2025 Updated)
-# ============================================================================
-
-class IndustryDatabase:
-    """
-    Professional-grade music industry classification database
-    Updated with 2024-2025 market data from IFPI, Billboard, and regional sources
-    """
-    
-    # BOLLYWOOD (India - Hindi Film Music) - 75-80% of Indian music revenue
-    BOLLYWOOD = {
-        "labels": [
-            # Major Labels (Tier 1)
-            "t-series", "tseries", "t series", "super cassettes", "sony music india",
-            "zee music company", "zee music", "saregama india", "tips music", "tips industries",
-            
-            # Film Production Houses with Music Arms
-            "yrf music", "yash raj films", "yash raj music", "dharma productions", "dharma music",
-            "eros music", "eros now", "venus music", "venus worldwide", "shemaroo entertainment",
-            "shemaroo", "rajshri music", "ultra bollywood", "ultra music india",
-            
-            # Digital-First Labels
-            "gaana", "jio saavn", "hungama digital media", "times music", "speed records india",
-            
-            # Legacy Labels
-            "hmv", "his master's voice", "music today", "magnasound", "plus music"
-        ],
-        "artists": [
-            # Male Playback Singers
-            "arijit singh", "sonu nigam", "kumar sanu", "udit narayan", "atif aslam",
-            "armaan malik", "jubin nautiyal", "darshan raval", "papon", "mohit chauhan",
-            "vishal dadlani", "shaan", "kailash kher", "mika singh", "sukhwinder singh",
-            
-            # Female Playback Singers
-            "shreya ghoshal", "alka yagnik", "neha kakkar", "dhvani bhanushali", "neeti mohan",
-            "sunidhi chauhan", "kanika kapoor", "tulsi kumar", "monali thakur", "jonita gandhi",
-            
-            # Music Composers/Directors
-            "pritam", "a.r. rahman", "vishal-shekhar", "sachin-jigar", "salim-sulaiman",
-            "amit trivedi", "tanishk bagchi", "badshah", "yo yo honey singh", "anu malik"
-        ],
-        "keywords": [
-            "bollywood", "hindi film", "hindi cinema", "mumbai film", "filmi", "playback",
-            "हिंदी", "बॉलीवुड", "फिल्म", "filmy", "hindi album"
-        ],
-        "confidence_boost": ["film", "movie", "soundtrack", "ost", "original motion picture"]
-    }
-    
-    # TOLLYWOOD (South Indian Film Music - Telugu, Tamil, Malayalam, Kannada)
-    TOLLYWOOD = {
-        "labels": [
-            # Telugu Labels
-            "lahari music", "lahari recording company", "aditya music", "mango music", 
-            "anand audio", "maa music", "sriranjani music",
-            
-            # Tamil Labels
-            "think music", "think music india", "sony music south", "saregama south",
-            "muzik247", "u1 records", "divo", "inreco",
-            
-            # Malayalam Labels
-            "manorama music", "goodwill entertainments", "millennium audios",
-            
-            # Pan-South Labels
-            "aditya videos", "volga videos", "sony music south india"
-        ],
-        "artists": [
-            # Composers
-            "devi sri prasad", "dsp", "anirudh ravichander", "thaman s", "s thaman",
-            "yuvan shankar raja", "g.v. prakash", "ghibran", "harris jayaraj", "d. imman",
-            
-            # Singers
-            "sid sriram", "chinmayi", "haricharan", "karthik", "vijay yesudas",
-            "shreya ghoshal", "anirudh", "jonita gandhi", "armaan malik"
-        ],
-        "keywords": [
-            "tollywood", "kollywood", "sandalwood", "mollywood",
-            "telugu", "tamil", "malayalam", "kannada",
-            "telugu film", "tamil cinema", "tamil film", "malayalam cinema",
-            "తెలుగు", "தமிழ்", "ತೆಲುಗು"
-        ],
-        "confidence_boost": ["telugu movie", "tamil movie", "malayalam movie", "south indian"]
-    }
-    
-    # PUNJABI MUSIC (India/Pakistan - Bhangra, Folk, Modern Punjabi Pop)
-    PUNJABI = {
-        "labels": [
-            "speed records", "white hill music", "saga music", "saga hits",
-            "t-series apna punjab", "47 records", "lokdhun punjabi", "brown town music",
-            "jass records", "gene get Punjabi", "fresh media records"
-        ],
-        "artists": [
-            "diljit dosanjh", "sidhu moose wala", "sidhu moosewala", "ap dhillon",
-            "karan aujla", "hardy sandhu", "guru randhawa", "badshah", "yo yo honey singh",
-            "amrinder gill", "ammy virk", "nimrat khaira", "jassi gill", "jassie gill",
-            "babbu maan", "gurdas maan", "gippy grewal", "sharry mann"
-        ],
-        "keywords": [
-            "punjabi", "bhangra", "desi", "pind", "jatt", "punjab",
-            "ਪੰਜਾਬੀ", "pollywood"
-        ],
-        "confidence_boost": ["punjabi song", "punjabi music", "punjabi album"]
-    }
-    
-    # HOLLYWOOD/INTERNATIONAL (Western Music - US, UK, Europe)
-    HOLLYWOOD = {
-        "labels": [
-            # Universal Music Group (38% market share)
-            "republic records", "interscope", "interscope records", "def jam", "island records",
-            "capitol records", "capitol music group", "motown", "geffen", "virgin records",
-            "universal music", "umg", "mercury records", "polydor", "decca",
-            
-            # Sony Music Entertainment (27% market share)
-            "columbia records", "rca records", "epic records", "arista records",
-            "sony music", "legacy recordings", "rca victor", "sony bmg", "syco music",
-            
-            # Warner Music Group (18% market share)
-            "atlantic records", "warner records", "warner bros records", "elektra records",
-            "parlophone", "warner music", "rhino records", "asylum records", "reprise records",
-            "nonesuch", "sire records", "fueled by ramen",
-            
-            # Major Independent Labels
-            "300 entertainment", "big machine", "big loud", "bmg rights", "domino",
-            "xl recordings", "rough trade", "matador", "sub pop", "epitaph"
-        ],
-        "artists": [
-            # Current Top Artists (2024-2025)
-            "taylor swift", "drake", "bad bunny", "the weeknd", "ariana grande",
-            "billie eilish", "post malone", "dua lipa", "ed sheeran", "beyonce",
-            "harry styles", "olivia rodrigo", "sabrina carpenter", "sza", "travis scott",
-            "morgan wallen", "zach bryan", "benson boone", "teddy swims", "hozier"
-        ],
-        "keywords": [
-            "billboard", "grammy", "american", "british", "uk music", "us music",
-            "hot 100", "pop music", "western music", "anglo", "english language"
-        ],
-        "confidence_boost": ["billboard hot 100", "grammy award", "american music", "uk charts"]
-    }
-    
-    # K-POP (South Korean Pop Music)
-    KPOP = {
-        "labels": [
-            # Big 4 Agencies
-            "hybe", "hybe corporation", "big hit entertainment", "big hit music", "bighit",
-            "sm entertainment", "sm town", "sm ent",
-            "jyp entertainment", "jyp ent",
-            "yg entertainment", "yg ent",
-            
-            # HYBE Subsidiaries
-            "ador", "belift lab", "source music", "pledis entertainment", "koz entertainment",
-            
-            # Other Major Agencies
-            "starship entertainment", "cube entertainment", "fnc entertainment",
-            "rbw", "p nation", "the black label", "kakao entertainment"
-        ],
-        "artists": [
-            # Groups
-            "bts", "blackpink", "twice", "exo", "seventeen", "stray kids", "newjeans",
-            "aespa", "txt", "tomorrow x together", "enhypen", "itzy", "ive", "le sserafim",
-            "nct", "nct 127", "nct dream", "red velvet", "gidle", "(g)i-dle",
-            
-            # Soloists
-            "psy", "iu", "jungkook", "jimin", "v", "lisa", "jennie", "rose", "jisoo"
-        ],
-        "keywords": [
-            "k-pop", "kpop", "k pop", "korean pop", "한국", "케이팝", "hallyu",
-            "idol", "comeback", "korean music"
-        ],
-        "confidence_boost": ["korean", "seoul", "korea", "kbs", "mnet"]
-    }
-    
-    # INDIE/INDEPENDENT (Self-Released, Small Labels, Bedroom Pop)
-    INDIE = {
-        "labels": [
-            "independent", "self-released", "unsigned", "indie music", "bedroom pop",
-            "soundcloud", "bandcamp", "distrokid", "tunecore", "cdbaby",
-            "artist first", "azadi records", "incink records", "pagal haina"
-        ],
-        "keywords": [
-            "indie", "independent", "self released", "unsigned artist", "diy",
-            "lo-fi", "lofi", "bedroom", "underground", "emerging artist"
-        ],
-        "confidence_boost": ["independent artist", "self-published", "unsigned"]
-    }
-
-# 7. MusicBrainz API Helper
 def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> dict:
-    """Enhanced MusicBrainz search with better error handling"""
+    """
+    Search MusicBrainz for track metadata
+    Returns: dict with 'found', 'release_type', 'labels', 'tags'
+    """
     try:
         base_url = "https://musicbrainz.org/ws/2/recording/"
         query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
-        if album and album.lower() not in ["unknown", "single", ""]:
+        if album and album.lower() != "unknown":
             query_parts.append(f'release:"{album}"')
         
         query = " AND ".join(query_parts)
-        params = {"query": query, "fmt": "json", "limit": 5}
-        headers = {"User-Agent": "AudioVibe/8.0 (contact@audiovibe.app)"}
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": 3
+        }
+        headers = {"User-Agent": "AudioVibe/7.0 (contact@audiovibe.app)"}
         
-        response = requests.get(base_url, params=params, headers=headers, timeout=7)
+        response = requests.get(base_url, params=params, headers=headers, timeout=5)
         
         if response.status_code == 200:
             data = response.json()
             if data.get("recordings"):
                 recording = data["recordings"][0]
                 releases = recording.get("releases", [])
-                tags = [tag["name"].lower() for tag in recording.get("tags", [])]
+                tags = [tag["name"] for tag in recording.get("tags", [])]
                 
                 labels = []
                 release_types = []
-                countries = []
-                
-                for release in releases[:5]:
+                for release in releases[:3]:
                     if "label-info" in release:
-                        for li in release["label-info"]:
-                            label_name = li.get("label", {}).get("name")
-                            if label_name:
-                                labels.append(label_name.lower())
-                    
-                    release_types.append(release.get("status", "").lower())
-                    country = release.get("country", "")
-                    if country:
-                        countries.append(country)
+                        labels.extend([li.get("label", {}).get("name") for li in release["label-info"]])
+                    release_types.append(release.get("status", ""))
                 
                 return {
                     "found": True,
-                    "labels": list(set(labels))[:10],
-                    "tags": tags[:10],
-                    "release_types": list(set(release_types)),
-                    "countries": list(set(countries)),
-                    "artist_credit": recording.get("artist-credit", [{}])[0].get("name", "").lower()
+                    "release_type": release_types[0] if release_types else "Unknown",
+                    "labels": list(set(labels))[:3],
+                    "tags": tags[:5]
                 }
     except Exception as e:
-        print(f"⚠️ MusicBrainz error: {e}")
+        print(f"MusicBrainz error: {e}")
     
-    return {"found": False, "labels": [], "tags": [], "release_types": [], "countries": [], "artist_credit": ""}
+    return {"found": False, "release_type": "Unknown", "labels": [], "tags": []}
 
-# 8. Wikipedia Helper
 def search_wikipedia(artist: str, album: str) -> dict:
-    """Enhanced Wikipedia search for soundtrack/film information"""
+    """
+    Search Wikipedia for album/movie information
+    Returns: dict with 'is_soundtrack', 'is_film_album', 'industry_hints'
+    """
     try:
-        if not album or album.lower() in ["unknown", "single", ""]:
-            return {"is_soundtrack": False, "is_film_album": False, "industry_hints": [], "categories": []}
+        if not album or album.lower() == "unknown":
+            return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
         
         search_url = "https://en.wikipedia.org/w/api.php"
         params = {
             "action": "query",
             "list": "search",
-            "srsearch": f"{album} {artist} soundtrack film album",
+            "srsearch": f"{album} {artist} album soundtrack",
             "format": "json",
-            "srlimit": 5
+            "srlimit": 3
         }
         
-        response = requests.get(search_url, params=params, timeout=7)
+        response = requests.get(search_url, params=params, timeout=5)
         if response.status_code == 200:
             data = response.json()
             results = data.get("query", {}).get("search", [])
@@ -466,197 +276,114 @@ def search_wikipedia(artist: str, album: str) -> dict:
             for result in results:
                 snippet = result.get("snippet", "").lower()
                 title = result.get("title", "").lower()
-                combined = f"{snippet} {title}"
                 
-                # Film/Soundtrack detection
-                is_soundtrack = any(word in combined for word in [
-                    "soundtrack", "original motion picture", "film score", "movie soundtrack",
-                    "original soundtrack", "ost", "film music"
-                ])
+                is_soundtrack = any(word in snippet or word in title 
+                                   for word in ["soundtrack", "film", "movie", "cinema"])
                 
-                # Industry-specific hints
                 industry_hints = []
-                categories = []
-                
-                if any(word in combined for word in ["bollywood", "hindi film", "mumbai", "indian cinema"]):
+                if any(word in snippet or word in title 
+                      for word in ["bollywood", "hindi film", "mumbai"]):
                     industry_hints.append("Bollywood")
-                    categories.append("indian_film")
-                
-                if any(word in combined for word in ["tollywood", "telugu film", "tamil film", "kollywood", "south indian"]):
+                if any(word in snippet or word in title 
+                      for word in ["tollywood", "telugu film", "tamil film", "kollywood"]):
                     industry_hints.append("Tollywood")
-                    categories.append("south_indian_film")
-                
-                if any(word in combined for word in ["punjabi music", "punjabi film", "pollywood"]):
+                if any(word in snippet or word in title 
+                      for word in ["punjabi music", "punjabi album"]):
                     industry_hints.append("Punjabi")
-                    categories.append("punjabi_music")
-                
-                if any(word in combined for word in ["hollywood", "american film", "warner bros", "universal pictures", "paramount"]):
-                    industry_hints.append("Hollywood")
-                    categories.append("hollywood_film")
-                
-                if any(word in combined for word in ["k-pop", "korean pop", "south korean", "korean music"]):
-                    industry_hints.append("K-Pop")
-                    categories.append("korean_music")
                 
                 if is_soundtrack or industry_hints:
                     return {
                         "is_soundtrack": is_soundtrack,
                         "is_film_album": is_soundtrack,
-                        "industry_hints": industry_hints,
-                        "categories": categories
+                        "industry_hints": industry_hints
                     }
         
     except Exception as e:
-        print(f"⚠️ Wikipedia error: {e}")
+        print(f"Wikipedia error: {e}")
     
-    return {"is_soundtrack": False, "is_film_album": False, "industry_hints": [], "categories": []}
+    return {"is_soundtrack": False, "is_film_album": False, "industry_hints": []}
 
-# 9. Advanced Scoring System
-def calculate_industry_scores(
-    artist: str,
-    title: str,
-    album: Optional[str],
-    musicbrainz_data: dict,
-    wiki_data: dict
-) -> Dict[str, float]:
+def detect_industry_enhanced(artist: str, title: str, album: Optional[str], 
+                            musicbrainz_data: dict, wiki_data: dict) -> str:
     """
-    Calculate confidence scores for each industry using weighted signals
-    Returns: Dictionary with industry names and confidence scores (0-100)
+    Advanced industry detection combining multiple signals
     """
-    
-    db = IndustryDatabase()
-    scores = {
-        "Bollywood": 0.0,
-        "Tollywood": 0.0,
-        "Punjabi": 0.0,
-        "Hollywood": 0.0,
-        "K-Pop": 0.0,
-        "Indie": 0.0
-    }
-    
     artist_lower = artist.lower()
-    title_lower = title.lower()
     album_lower = album.lower() if album else ""
     
-    # Combine all available text
-    mb_labels = " ".join(musicbrainz_data.get("labels", [])).lower()
-    mb_tags = " ".join(musicbrainz_data.get("tags", [])).lower()
-    mb_countries = " ".join(musicbrainz_data.get("countries", [])).lower()
-    combined_text = f"{artist_lower} {title_lower} {album_lower} {mb_labels} {mb_tags}"
+    # Check Wikipedia hints first (most reliable for film music)
+    if wiki_data.get("industry_hints"):
+        return wiki_data["industry_hints"][0]
     
     # Film/Soundtrack detection
     is_film_music = (
         wiki_data.get("is_soundtrack", False) or
-        any(word in album_lower for word in ["soundtrack", "ost", "original motion picture", "film", "movie"])
+        any(word in album_lower for word in [
+            "soundtrack", "ost", "original score", "film", "movie", 
+            "cinema", "picture"
+        ])
     )
     
-    # Score each industry
-    for industry_name in scores.keys():
-        industry_data = getattr(db, industry_name.upper().replace("-", ""))
-        
-        # 1. Wikipedia hints (40 points - highest weight)
-        if industry_name in wiki_data.get("industry_hints", []):
-            scores[industry_name] += 40
-        
-        # 2. Label matching (30 points)
-        label_matches = sum(1 for label in industry_data["labels"] if label in combined_text)
-        scores[industry_name] += min(30, label_matches * 15)  # Max 30 points
-        
-        # 3. Artist matching (20 points)
-        artist_matches = sum(1 for artist_name in industry_data["artists"] if artist_name in artist_lower)
-        scores[industry_name] += min(20, artist_matches * 20)  # Max 20 points
-        
-        # 4. Keyword matching (10 points)
-        keyword_matches = sum(1 for keyword in industry_data["keywords"] if keyword in combined_text)
-        scores[industry_name] += min(10, keyword_matches * 5)  # Max 10 points
-        
-        # 5. Film music boost (10 points)
-        if is_film_music and "confidence_boost" in industry_data:
-            boost_matches = sum(1 for word in industry_data["confidence_boost"] if word in combined_text)
-            scores[industry_name] += min(10, boost_matches * 5)
-        
-        # 6. Country/Region matching (5 points)
-        if industry_name == "Bollywood" and "in" in mb_countries:
-            scores[industry_name] += 5
-        elif industry_name == "Tollywood" and "in" in mb_countries:
-            scores[industry_name] += 5
-        elif industry_name == "K-Pop" and "kr" in mb_countries:
-            scores[industry_name] += 5
-        elif industry_name == "Hollywood" and any(c in mb_countries for c in ["us", "gb", "uk"]):
-            scores[industry_name] += 5
+    # Indian Film Industry Detection
+    bollywood_indicators = [
+        "bollywood", "hindi", "mumbai", "t-series", "zee music",
+        "sony music india", "yrf", "dharma", "eros", "tips"
+    ]
+    tollywood_indicators = [
+        "tollywood", "telugu", "tamil", "kollywood", "malayalam",
+        "lahari", "aditya music", "mango music", "saregama south"
+    ]
+    punjabi_indicators = [
+        "punjabi", "speed records", "white hill", "saga music"
+    ]
     
-    # Normalize scores to 0-100 range
-    max_possible = 115  # 40 + 30 + 20 + 10 + 10 + 5
-    for industry in scores:
-        scores[industry] = min(100, (scores[industry] / max_possible) * 100)
+    # Check MusicBrainz labels
+    labels = " ".join(musicbrainz_data.get("labels", [])).lower()
+    tags = " ".join(musicbrainz_data.get("tags", [])).lower()
     
-    return scores
-
-# 10. Advanced Industry Detection with Confidence Scoring
-def detect_industry_advanced(
-    artist: str,
-    title: str,
-    album: Optional[str],
-    musicbrainz_data: dict,
-    wiki_data: dict
-) -> Tuple[str, float, Dict[str, float]]:
-    """
-    Advanced industry detection with confidence scoring
-    Returns: (industry_name, confidence_percentage, all_scores)
-    """
+    combined_text = f"{artist_lower} {album_lower} {labels} {tags}"
     
-    scores = calculate_industry_scores(artist, title, album, musicbrainz_data, wiki_data)
+    # Film music gets priority
+    if is_film_music:
+        if any(ind in combined_text for ind in bollywood_indicators):
+            return "Bollywood"
+        if any(ind in combined_text for ind in tollywood_indicators):
+            return "Tollywood"
+        if any(ind in combined_text for ind in punjabi_indicators):
+            return "Punjabi"
     
-    # Get top industry
-    top_industry = max(scores, key=scores.get)
-    top_confidence = scores[top_industry]
+    # Non-film Indian music
+    if any(ind in combined_text for ind in bollywood_indicators):
+        # Check if it's independent artist
+        indie_labels = ["independent", "self-released", "indie", "unsigned"]
+        if any(label in labels for label in indie_labels):
+            return "Indie"
+        return "Bollywood"
     
-    # If confidence is too low (< 20%), use Groq AI fallback
-    if top_confidence < 20:
-        print(f"⚠️ Low confidence ({top_confidence:.1f}%), will use Groq fallback")
+    if any(ind in combined_text for ind in tollywood_indicators):
+        return "Tollywood"
     
-    return top_industry, top_confidence, scores
-
-# 11. Groq AI Fallback for Uncertain Cases
-def groq_industry_fallback(artist: str, title: str, album: str, context: str, scores: Dict[str, float]) -> str:
-    """Use Groq AI when confidence is low"""
-    try:
-        top_3 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
-        candidates = ", ".join([f"{ind} ({score:.1f}%)" for ind, score in top_3])
-        
-        prompt = (
-            f"Identify the music industry for this track:\n\n"
-            f"Artist: {artist}\n"
-            f"Title: {title}\n"
-            f"Album: {album}\n"
-            f"Context: {context}\n\n"
-            f"Top candidates from analysis: {candidates}\n\n"
-            f"Options: Bollywood, Tollywood, Punjabi, Hollywood, K-Pop, Indie\n\n"
-            f"Based on the artist name, title, and context, which industry is most likely?\n"
-            f"Output ONLY the industry name, nothing else."
-        )
-        
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are a music industry expert. Output only the industry name."},
-                {"role": "user", "content": prompt}
-            ],
-            model=GROQ_MODELS["primary"],
-            temperature=0.2,
-            max_tokens=30
-        )
-        
-        result = chat_completion.choices[0].message.content.strip()
-        valid_industries = ["Bollywood", "Tollywood", "Punjabi", "Hollywood", "K-Pop", "Indie"]
-        
-        if result in valid_industries:
-            print(f"🤖 Groq AI override: {result}")
-            return result
-            
-    except Exception as e:
-        print(f"⚠️ Groq fallback error: {e}")
+    if any(ind in combined_text for ind in punjabi_indicators):
+        return "Punjabi"
     
-    return max(scores, key=scores.get)  # Return highest scored if Groq fails
+    # Western/International detection
+    western_indicators = [
+        "atlantic", "columbia", "universal", "warner", "epic", "interscope",
+        "capitol", "rca", "def jam", "republic"
+    ]
+    if any(ind in labels for ind in western_indicators):
+        return "International"
+    
+    # Default to Indie for unknown/independent releases
+    if "independent" in labels or "self" in labels:
+        return "Indie"
+    
+    # Last resort: check language/region
+    indian_names = ["kumar", "singh", "sharma", "khan", "rao", "reddy", "iyer"]
+    if any(name in artist_lower for name in indian_names):
+        return "Indie"
+    
+    return "International"
 
 # ============================================================
 # 📌 API ENDPOINTS
@@ -668,9 +395,8 @@ def read_root():
         return {"status": "Maintenance Mode", "error": startup_error}
     return {
         "status": "Active",
-        "version": "8.0.0-Professional-Secure",
-        "message": "Secure API with Professional-Grade Industry Detection",
-        "features": ["Advanced Industry Detection", "Confidence Scoring", "Security Middleware"]
+        "version": "7.0.0-Enhanced",
+        "message": "Secure API with Enhanced Metadata Detection"
     }
 
 @app.get("/health")
@@ -753,7 +479,7 @@ async def enrich_metadata(
     x_app_version: str = Header(...)
 ):
     """
-    Enhanced metadata enrichment with professional-grade industry detection (secured by middleware)
+    Enhanced metadata enrichment with industry detection (secured by middleware)
     """
     ensure_ready()
     
@@ -768,48 +494,59 @@ async def enrich_metadata(
 
     print(f"🔍 Analyzing: '{clean_title}' by '{clean_artist}' from '{clean_album}'")
     
-    # Step 1: External data collection
+    # Step 1: Search external sources
     musicbrainz_data = search_musicbrainz(clean_artist, clean_title, clean_album)
     wiki_data = search_wikipedia(clean_artist, clean_album)
     
-    print(f"📊 MusicBrainz: Found={musicbrainz_data.get('found')}, Labels={len(musicbrainz_data.get('labels', []))}")
-    print(f"📖 Wikipedia: Soundtrack={wiki_data.get('is_soundtrack')}, Hints={wiki_data.get('industry_hints')}")
+    print(f"📊 MusicBrainz: {musicbrainz_data}")
+    print(f"📖 Wikipedia: {wiki_data}")
     
-    # Step 2: Advanced industry detection with confidence scoring
-    industry, confidence, all_scores = detect_industry_advanced(
+    # Step 2: Enhanced industry detection
+    industry = detect_industry_enhanced(
         clean_artist, clean_title, clean_album,
         musicbrainz_data, wiki_data
     )
     
-    print(f"📈 Industry Scores: {json.dumps({k: f'{v:.1f}%' for k, v in all_scores.items()}, indent=2)}")
-    print(f"🏆 Winner: {industry} (Confidence: {confidence:.1f}%)")
+    print(f"🏭 Detected Industry: {industry}")
     
-    # Step 3: Groq AI fallback for low confidence
-    if confidence < 25:
-        context = f"Labels: {', '.join(musicbrainz_data.get('labels', [])[:3])}, Tags: {', '.join(musicbrainz_data.get('tags', [])[:3])}"
-        industry = groq_industry_fallback(clean_artist, clean_title, clean_album, context, all_scores)
-        print(f"🤖 Final Industry (AI Override): {industry}")
-    
-    # Step 4: Groq Classification for Mood, Language, Genre
-    context_info = f"Artist: {clean_artist}, Title: {clean_title}, Industry: {industry}"
-    if clean_album:
+    # Step 3: Build context for Groq
+    context_info = f"Artist: {clean_artist}, Title: {clean_title}"
+    if clean_album and clean_album.lower() != "unknown":
         context_info += f", Album: {clean_album}"
+    
     if musicbrainz_data.get("found"):
         context_info += f", Labels: {', '.join(musicbrainz_data['labels'][:2])}"
+        context_info += f", Tags: {', '.join(musicbrainz_data['tags'][:3])}"
     
+    if wiki_data.get("is_film_album"):
+        context_info += ", Type: Film Soundtrack"
+    
+    # Step 4: Groq Classification (Mood, Language, Genre)
     prompt = (
-        f"Analyze: {context_info}\n\n"
-        "Classify this music track:\n\n"
-        "1. MOOD: Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting, Party\n"
-        "2. LANGUAGE: Hindi, Telugu, Tamil, Punjabi, English, Korean, etc.\n"
-        "3. GENRE: Pop, Rock, Hip-Hop, Folk, Devotional, Classical, EDM, LoFi, Jazz, Bhangra\n\n"
-        "Output JSON:\n"
-        '{"mood": "...", "language": "...", "genre": "..."}'
+        f"Analyze: {context_info}\n"
+        f"Detected Industry: {industry}\n\n"
+        
+        "TASK 1: MOOD\n"
+        "   Options: Aggressive, Energetic, Romantic, Melancholic, Spiritual, Chill, Uplifting\n\n"
+        
+        "TASK 2: LANGUAGE\n"
+        "   Detect primary language (Hindi, Telugu, Tamil, Punjabi, English, etc.)\n\n"
+        
+        "TASK 3: GENRE (Simple categories)\n"
+        "   Options: Party, Pop, Rock, Hip-Hop, Folk, Devotional, Classical, LoFi, EDM, Jazz\n\n"
+        
+        "OUTPUT JSON:\n"
+        "{\n"
+        '  "mood": "...",\n'
+        '  "language": "...",\n'
+        '  "genre": "..."\n'
+        "}"
     )
 
     try:
         chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
+            messages=[
+                {"role": "system", "content": "You are a music metadata classifier. Output strict JSON only."},
                 {"role": "user", "content": prompt}
             ],
             model=GROQ_MODELS["primary"],
@@ -826,171 +563,26 @@ async def enrich_metadata(
         genre = data.get("genre", "Pop").title()
 
     except Exception as e:
-        print(f"⚠️ Groq classification error: {e}")
+        print(f"⚠️ Groq error: {e}")
         mood, language, genre = "Neutral", "Unknown", "Pop"
 
-    # Final result with comprehensive metadata
+    # Final result
     result = {
         "formatted": f"{mood};{language};{industry};{genre}",
         "mood": mood,
         "language": language,
         "industry": industry,
         "genre": genre,
-        "confidence": round(confidence, 2),
-        "industry_scores": {k: round(v, 2) for k, v in all_scores.items()},
-        "sources_used": {
-            "musicbrainz": musicbrainz_data.get("found", False),
-            "wikipedia": bool(wiki_data.get("industry_hints")),
-            "labels_found": len(musicbrainz_data.get("labels", [])),
-            "is_soundtrack": wiki_data.get("is_film_album", False),
-            "groq_fallback_used": confidence < 25
-        },
-        "detection_metadata": {
-            "labels": musicbrainz_data.get("labels", [])[:5],
-            "tags": musicbrainz_data.get("tags", [])[:5],
-            "countries": musicbrainz_data.get("countries", []),
-            "wiki_categories": wiki_data.get("categories", [])
+        "metadata_sources": {
+            "musicbrainz_found": musicbrainz_data.get("found", False),
+            "wikipedia_checked": bool(wiki_data.get("industry_hints"))
         }
     }
     
     metadata_cache[cache_key] = result
-    print(f"✅ Final Result: {result['formatted']} (Confidence: {confidence:.1f}%)")
+    print(f"✅ Result: {result['formatted']}")
     
     return result
-
-@app.get("/industry-info")
-async def get_industry_info():
-    """
-    Endpoint to get information about supported industries
-    """
-    db = IndustryDatabase()
-    return {
-        "version": "8.0.0",
-        "supported_industries": [
-            {
-                "name": "Bollywood",
-                "description": "Hindi Film Music Industry (India)",
-                "major_labels": db.BOLLYWOOD["labels"][:5],
-                "sample_artists": db.BOLLYWOOD["artists"][:5],
-                "market_share": "~75-80% of Indian music revenue"
-            },
-            {
-                "name": "Tollywood",
-                "description": "South Indian Film Music (Telugu, Tamil, Malayalam, Kannada)",
-                "major_labels": db.TOLLYWOOD["labels"][:5],
-                "sample_artists": db.TOLLYWOOD["artists"][:5],
-                "market_share": "~15-20% of Indian music revenue"
-            },
-            {
-                "name": "Punjabi",
-                "description": "Punjabi Pop, Folk & Bhangra",
-                "major_labels": db.PUNJABI["labels"][:3],
-                "sample_artists": db.PUNJABI["artists"][:5],
-                "market_share": "Growing segment in Indian music"
-            },
-            {
-                "name": "Hollywood",
-                "description": "Western Music (US, UK, Europe)",
-                "major_labels": db.HOLLYWOOD["labels"][:5],
-                "sample_artists": db.HOLLYWOOD["artists"][:5],
-                "market_share": "Global leader (~60% worldwide revenue)"
-            },
-            {
-                "name": "K-Pop",
-                "description": "South Korean Pop Music",
-                "major_labels": db.KPOP["labels"][:5],
-                "sample_artists": db.KPOP["artists"][:5],
-                "market_share": "~$5B+ global industry"
-            },
-            {
-                "name": "Indie",
-                "description": "Independent & Self-Released Artists",
-                "major_labels": db.INDIE["labels"][:3],
-                "sample_artists": ["Various emerging artists"],
-                "market_share": "Rapidly growing segment"
-            }
-        ],
-        "detection_methodology": {
-            "scoring_system": "Multi-factor weighted scoring (0-100)",
-            "factors": [
-                {"name": "Wikipedia Industry Hints", "weight": 40},
-                {"name": "Record Label Matching", "weight": 30},
-                {"name": "Artist Name Matching", "weight": 20},
-                {"name": "Keyword Detection", "weight": 10},
-                {"name": "Film Music Context", "weight": 10},
-                {"name": "Geographic/Country Data", "weight": 5}
-            ],
-            "fallback": "Groq AI used when confidence < 25%",
-            "data_sources": ["MusicBrainz", "Wikipedia", "Groq AI", "Internal Database"]
-        }
-    }
-
-@app.post("/batch-enrich")
-async def batch_enrich_metadata(
-    songs: List[SongRequest],
-    x_app_timestamp: str = Header(...),
-    x_app_integrity: str = Header(...),
-    x_device_id: str = Header(...),
-    x_app_version: str = Header(...)
-):
-    """
-    Batch endpoint for enriching multiple songs at once (secured by middleware)
-    Useful for bulk imports
-    """
-    ensure_ready()
-    
-    results = []
-    for song in songs[:50]:  # Limit to 50 songs per request
-        try:
-            result = await enrich_metadata(song, x_app_timestamp, x_app_integrity, x_device_id, x_app_version)
-            results.append({
-                "artist": song.artist,
-                "title": song.title,
-                "success": True,
-                "metadata": result
-            })
-        except Exception as e:
-            results.append({
-                "artist": song.artist,
-                "title": song.title,
-                "success": False,
-                "error": str(e)
-            })
-    
-    return {
-        "total": len(songs),
-        "processed": len(results),
-        "results": results
-    }
-
-@app.get("/cache-stats")
-async def get_cache_stats():
-    """
-    Get statistics about the metadata cache
-    """
-    return {
-        "cache_size": len(metadata_cache),
-        "sample_keys": list(metadata_cache.keys())[:5] if metadata_cache else [],
-        "memory_usage_estimate_mb": len(json.dumps(metadata_cache)) / (1024 * 1024)
-    }
-
-@app.delete("/cache")
-async def clear_cache(
-    x_app_timestamp: str = Header(...),
-    x_app_integrity: str = Header(...),
-    x_device_id: str = Header(...),
-    x_app_version: str = Header(...)
-):
-    """
-    Clear the metadata cache (admin endpoint, secured by middleware)
-    """
-    global metadata_cache
-    cache_size = len(metadata_cache)
-    metadata_cache = {}
-    return {
-        "status": "cleared",
-        "entries_removed": cache_size
-    }
 
 # ============================================================
 # 🚀 APPLICATION ENTRY POINT
