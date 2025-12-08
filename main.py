@@ -18,7 +18,7 @@ from groq import Groq
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure API", version="7.0.6-Final")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.7-AccuracyFix")
 
 # ============================================================
 # 🔐 SECURITY CONFIGURATION
@@ -28,7 +28,6 @@ app = FastAPI(title="AudioVibe Secure API", version="7.0.6-Final")
 APP_INTEGRITY_SECRET = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
 
 # ⚠️ ALLOWED APP VERSIONS
-# ✅ FIX: Added "1.0" because your Android logs showed the phone sending "1.0"
 ALLOWED_APP_VERSIONS = ["1.0", "1.0.0", "1.0.1", "1.1.0"]
 
 # 🚫 Rate Limiting Configuration
@@ -150,7 +149,6 @@ async def security_middleware(request: Request, call_next):
 
     # 8. Rate Limiting
     current_time = time.time()
-    # Remove requests older than the window
     rate_limit_storage[device_id] = [t for t in rate_limit_storage[device_id] if current_time - t < RATE_LIMIT_WINDOW]
     
     if len(rate_limit_storage[device_id]) >= RATE_LIMIT_MAX_REQUESTS:
@@ -221,9 +219,9 @@ def search_wikipedia(artist: str, album: str) -> dict:
                 txt = (r.get("snippet", "") + r.get("title", "")).lower()
                 if "bollywood" in txt or "hindi" in txt: hints.append("Bollywood")
                 if "tollywood" in txt or "telugu" in txt: hints.append("Tollywood")
+                if "kollywood" in txt or "tamil" in txt: hints.append("Kollywood")
                 if "punjabi" in txt: hints.append("Punjabi")
                 
-                # Check for soundtrack keywords
                 if "soundtrack" in txt or "ost" in txt:
                     is_soundtrack = True
 
@@ -237,6 +235,7 @@ def detect_industry(artist, album, mb_data, wiki_data):
     txt = f"{artist} {album} {' '.join(mb_data.get('labels', []))}".lower()
     if "bollywood" in txt: return "Bollywood"
     if "tollywood" in txt: return "Tollywood"
+    if "kollywood" in txt: return "Kollywood"
     if "punjabi" in txt: return "Punjabi"
     return "International"
 
@@ -247,7 +246,7 @@ def detect_industry(artist, album, mb_data, wiki_data):
 @app.get("/")
 def read_root():
     status = "Maintenance Mode" if startup_error else "Active"
-    return {"status": status, "version": "7.0.6-Final", "error": startup_error}
+    return {"status": status, "version": "7.0.7-AccuracyFix", "error": startup_error}
 
 @app.get("/health")
 def health_check():
@@ -277,19 +276,26 @@ async def enrich_metadata(
     mb_data = search_musicbrainz(clean_artist, clean_title, clean_album)
     wiki_data = search_wikipedia(clean_artist, clean_album)
     
-    # 2. Basic Python Industry Detection (Keyword based)
+    # 2. Basic Python Industry Detection (Used as Hint)
     detected_industry_python = detect_industry(clean_artist, clean_album, mb_data, wiki_data)
     
-    context = f"Artist: {clean_artist}, Title: {clean_title}, Album: {clean_album}, PythonDetectedIndustry: {detected_industry_python}"
+    context = f"Artist: {clean_artist}, Title: {clean_title}, Album: {clean_album}, PythonHint: {detected_industry_python}"
     if mb_data['found']: context += f", Labels: {', '.join(mb_data['labels'])}"
     
-    # 3. GROQ PROMPT (Updated to ask for Industry)
+    # 3. GROQ PROMPT (Refined for Accuracy)
     prompt = (
-        f"Analyze: {context}\n"
-        "TASK 1: MOOD (Aggressive, Energetic, Romantic, Melancholic, Chill, Uplifting)\n"
-        "TASK 2: LANGUAGE (Hindi, Telugu, Punjabi, English, Tamil, Malayalam, etc.)\n"
-        "TASK 3: GENRE (Party, Pop, Hip-Hop, Folk, Devotional, LoFi, EDM, Jazz)\n"
-        "TASK 4: INDUSTRY (Bollywood, Tollywood, Mollywood, Kollywood, Punjabi, International, Indie)\n"
+        f"Analyze this song metadata:\n{context}\n\n"
+        "INSTRUCTIONS:\n"
+        "1. MOOD: Pick one (Aggressive, Energetic, Romantic, Melancholic, Chill, Uplifting).\n"
+        "2. LANGUAGE: Detect the language of the LYRICS (e.g. Hindi, Punjabi, Telugu, English). If title is English but lyrics are Hindi/Punjabi, output the lyric language.\n"
+        "3. GENRE: Pick one (Party, Pop, Hip-Hop, Folk, Devotional, LoFi, EDM, Jazz, Classical).\n"
+        "4. INDUSTRY: Detect the film industry or music scene (Bollywood, Tollywood, Kollywood, Mollywood, Punjabi, International, Indie).\n"
+        "   - Use 'Bollywood' for Hindi movie songs.\n"
+        "   - Use 'Tollywood' for Telugu, 'Kollywood' for Tamil.\n"
+        "   - Use 'Punjabi' for Punjabi Pop/Film.\n"
+        "   - Use 'Indie' for independent artists not tied to film.\n"
+        "   - Use 'International' ONLY for English/Western music.\n"
+        "\n"
         "OUTPUT: Return ONLY raw JSON.\n"
         "{ \"mood\": \"...\", \"language\": \"...\", \"genre\": \"...\", \"industry\": \"...\" }"
     )
@@ -319,14 +325,15 @@ async def enrich_metadata(
         language = data.get("language", "Unknown").title()
         genre = data.get("genre", "Pop").title()
         
-        # ✅ SMART INDUSTRY LOGIC
-        # If Python thought it was "International" (default), but AI says "Punjabi", trust the AI.
+        # ✅ SMART INDUSTRY LOGIC (UPDATED)
+        # Trust the AI's industry logic first as it has better context
         ai_industry = data.get("industry", "International").title()
         
-        if detected_industry_python == "International" and ai_industry != "International":
-            final_industry = ai_industry
-        else:
+        # Only fallback to Python hint if AI failed (returned Unknown/International when Python found something specific)
+        if (ai_industry == "International" or ai_industry == "Unknown") and detected_industry_python != "International":
             final_industry = detected_industry_python
+        else:
+            final_industry = ai_industry
 
     except json.JSONDecodeError as e:
         print(f"⚠️ JSON Parse Error: {e} | Content: {content}")
@@ -335,7 +342,7 @@ async def enrich_metadata(
         print(f"⚠️ Groq API Error: {e}")
         mood, language, genre, final_industry = "Neutral", "Unknown", "Pop", detected_industry_python
 
-    # ✅ Construct Result matching what Flutter expects
+    # ✅ Construct Result
     result = {
         "formatted": f"{mood};{language};{final_industry};{genre}",
         "mood": mood, 
@@ -390,6 +397,23 @@ async def add_track(
     except Exception as e:
         print(f"❌ Upload Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/record-play")
+async def record_play(
+    stat: PlayRecord,
+    x_app_timestamp: str = Header(...),
+    x_app_integrity: str = Header(...),
+    x_device_id: str = Header(...),
+    x_app_version: str = Header(...)
+):
+    ensure_ready()
+    try:
+        # Example: Call a Supabase RPC or insert into a table
+        # supabase.table("play_history").insert(stat.dict()).execute()
+        return {"status": "recorded"}
+    except Exception as e:
+        print(f"❌ Stats Error: {e}")
+        return {"status": "error"}
 
 if __name__ == "__main__":
     import uvicorn
