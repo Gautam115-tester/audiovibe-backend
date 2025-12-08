@@ -18,7 +18,7 @@ from groq import Groq
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure API", version="7.0.5-Hotfix")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.6-Final")
 
 # ============================================================
 # 🔐 SECURITY CONFIGURATION
@@ -27,8 +27,8 @@ app = FastAPI(title="AudioVibe Secure API", version="7.0.5-Hotfix")
 # ✅ MUST MATCH Flutter's SecurityService._appSecret
 APP_INTEGRITY_SECRET = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
 
-# ⚠️ ALLOWED APP VERSIONS (Updated to include "1.0")
-# ✅ FIX: Added "1.0" to allow your current Flutter build to pass
+# ⚠️ ALLOWED APP VERSIONS
+# ✅ FIX: Added "1.0" because your Android logs showed the phone sending "1.0"
 ALLOWED_APP_VERSIONS = ["1.0", "1.0.0", "1.0.1", "1.1.0"]
 
 # 🚫 Rate Limiting Configuration
@@ -247,7 +247,7 @@ def detect_industry(artist, album, mb_data, wiki_data):
 @app.get("/")
 def read_root():
     status = "Maintenance Mode" if startup_error else "Active"
-    return {"status": status, "version": "7.0.5-Hotfix", "error": startup_error}
+    return {"status": status, "version": "7.0.6-Final", "error": startup_error}
 
 @app.get("/health")
 def health_check():
@@ -277,20 +277,21 @@ async def enrich_metadata(
     mb_data = search_musicbrainz(clean_artist, clean_title, clean_album)
     wiki_data = search_wikipedia(clean_artist, clean_album)
     
-    # 2. Industry Detection
-    industry = detect_industry(clean_artist, clean_album, mb_data, wiki_data)
+    # 2. Basic Python Industry Detection (Keyword based)
+    detected_industry_python = detect_industry(clean_artist, clean_album, mb_data, wiki_data)
     
-    context = f"Artist: {clean_artist}, Title: {clean_title}, Album: {clean_album}, Industry: {industry}"
+    context = f"Artist: {clean_artist}, Title: {clean_title}, Album: {clean_album}, PythonDetectedIndustry: {detected_industry_python}"
     if mb_data['found']: context += f", Labels: {', '.join(mb_data['labels'])}"
     
-    # GROQ PROMPT
+    # 3. GROQ PROMPT (Updated to ask for Industry)
     prompt = (
         f"Analyze: {context}\n"
         "TASK 1: MOOD (Aggressive, Energetic, Romantic, Melancholic, Chill, Uplifting)\n"
-        "TASK 2: LANGUAGE (Hindi, Telugu, Punjabi, English, etc.)\n"
+        "TASK 2: LANGUAGE (Hindi, Telugu, Punjabi, English, Tamil, Malayalam, etc.)\n"
         "TASK 3: GENRE (Party, Pop, Hip-Hop, Folk, Devotional, LoFi, EDM, Jazz)\n"
+        "TASK 4: INDUSTRY (Bollywood, Tollywood, Mollywood, Kollywood, Punjabi, International, Indie)\n"
         "OUTPUT: Return ONLY raw JSON.\n"
-        "{ \"mood\": \"...\", \"language\": \"...\", \"genre\": \"...\" }"
+        "{ \"mood\": \"...\", \"language\": \"...\", \"genre\": \"...\", \"industry\": \"...\" }"
     )
 
     try:
@@ -317,26 +318,35 @@ async def enrich_metadata(
         mood = data.get("mood", "Neutral").title()
         language = data.get("language", "Unknown").title()
         genre = data.get("genre", "Pop").title()
+        
+        # ✅ SMART INDUSTRY LOGIC
+        # If Python thought it was "International" (default), but AI says "Punjabi", trust the AI.
+        ai_industry = data.get("industry", "International").title()
+        
+        if detected_industry_python == "International" and ai_industry != "International":
+            final_industry = ai_industry
+        else:
+            final_industry = detected_industry_python
 
     except json.JSONDecodeError as e:
         print(f"⚠️ JSON Parse Error: {e} | Content: {content}")
-        mood, language, genre = "Neutral", "Unknown", "Pop"
+        mood, language, genre, final_industry = "Neutral", "Unknown", "Pop", detected_industry_python
     except Exception as e:
         print(f"⚠️ Groq API Error: {e}")
-        mood, language, genre = "Neutral", "Unknown", "Pop"
+        mood, language, genre, final_industry = "Neutral", "Unknown", "Pop", detected_industry_python
 
-    # ✅ FIX: Construct Result matching what Flutter expects
-    # Your Flutter code looks for `sources_used`, so we must send it!
+    # ✅ Construct Result matching what Flutter expects
     result = {
-        "formatted": f"{mood};{language};{industry};{genre}",
+        "formatted": f"{mood};{language};{final_industry};{genre}",
         "mood": mood, 
         "language": language, 
-        "industry": industry, 
+        "industry": final_industry, 
         "genre": genre,
         "sources_used": {
             "musicbrainz": mb_data.get("found", False),
             "is_soundtrack": wiki_data.get("is_soundtrack", False),
-            "wiki_hints": len(wiki_data.get("industry_hints", [])) > 0
+            "wiki_hints": len(wiki_data.get("industry_hints", [])) > 0,
+            "ai_industry_override": (final_industry != detected_industry_python)
         }
     }
     
