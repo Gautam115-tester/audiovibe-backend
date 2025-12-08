@@ -18,7 +18,7 @@ from groq import Groq
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure API", version="7.0.4-Patched")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.5-Hotfix")
 
 # ============================================================
 # 🔐 SECURITY CONFIGURATION
@@ -27,8 +27,9 @@ app = FastAPI(title="AudioVibe Secure API", version="7.0.4-Patched")
 # ✅ MUST MATCH Flutter's SecurityService._appSecret
 APP_INTEGRITY_SECRET = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
 
-# ⚠️ ALLOWED APP VERSIONS (Update when you release new versions)
-ALLOWED_APP_VERSIONS = ["1.0.0", "1.0.1", "1.1.0"]
+# ⚠️ ALLOWED APP VERSIONS (Updated to include "1.0")
+# ✅ FIX: Added "1.0" to allow your current Flutter build to pass
+ALLOWED_APP_VERSIONS = ["1.0", "1.0.0", "1.0.1", "1.1.0"]
 
 # 🚫 Rate Limiting Configuration
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -111,7 +112,7 @@ async def security_middleware(request: Request, call_next):
     device_id = request.headers.get("x-device-id")
     app_version = request.headers.get("x-app-version")
 
-    # Debug Printing (Helpful for development)
+    # Debug Printing
     print(f"\n🔍 SEC_CHECK: {request.url.path} | Device: {device_id} | Ver: {app_version}")
 
     # 4. Validate Presence
@@ -122,7 +123,7 @@ async def security_middleware(request: Request, call_next):
     # 5. Validate App Version
     if app_version not in ALLOWED_APP_VERSIONS:
         print(f"   ⚠️ REJECTED: Unsupported Version '{app_version}'")
-        return JSONResponse(status_code=403, content={"detail": "Unsupported app version. Please update."})
+        return JSONResponse(status_code=403, content={"detail": f"Unsupported app version: {app_version}. Allowed: {ALLOWED_APP_VERSIONS}"})
 
     # 6. Validate Timestamp (Replay Attack Protection)
     try:
@@ -210,19 +211,26 @@ def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> 
 
 def search_wikipedia(artist: str, album: str) -> dict:
     try:
-        if not album or album.lower() == "unknown": return {"industry_hints": []}
+        if not album or album.lower() == "unknown": return {"industry_hints": [], "is_soundtrack": False}
         response = requests.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "list": "search", "srsearch": f"{album} {artist} album", "format": "json", "srlimit": 3}, timeout=5)
         if response.status_code == 200:
             results = response.json().get("query", {}).get("search", [])
             hints = []
+            is_soundtrack = False
             for r in results:
                 txt = (r.get("snippet", "") + r.get("title", "")).lower()
                 if "bollywood" in txt or "hindi" in txt: hints.append("Bollywood")
                 if "tollywood" in txt or "telugu" in txt: hints.append("Tollywood")
                 if "punjabi" in txt: hints.append("Punjabi")
-            if hints: return {"industry_hints": list(set(hints))}
+                
+                # Check for soundtrack keywords
+                if "soundtrack" in txt or "ost" in txt:
+                    is_soundtrack = True
+
+            if hints or is_soundtrack: 
+                return {"industry_hints": list(set(hints)), "is_soundtrack": is_soundtrack}
     except Exception: pass
-    return {"industry_hints": []}
+    return {"industry_hints": [], "is_soundtrack": False}
 
 def detect_industry(artist, album, mb_data, wiki_data):
     if wiki_data.get("industry_hints"): return wiki_data["industry_hints"][0]
@@ -239,7 +247,7 @@ def detect_industry(artist, album, mb_data, wiki_data):
 @app.get("/")
 def read_root():
     status = "Maintenance Mode" if startup_error else "Active"
-    return {"status": status, "version": "7.0.4-Patched", "error": startup_error}
+    return {"status": status, "version": "7.0.5-Hotfix", "error": startup_error}
 
 @app.get("/health")
 def health_check():
@@ -265,8 +273,11 @@ async def enrich_metadata(
 
     print(f"🔍 Analyzing New Track: {clean_title} by {clean_artist}")
     
+    # 1. External Search
     mb_data = search_musicbrainz(clean_artist, clean_title, clean_album)
     wiki_data = search_wikipedia(clean_artist, clean_album)
+    
+    # 2. Industry Detection
     industry = detect_industry(clean_artist, clean_album, mb_data, wiki_data)
     
     context = f"Artist: {clean_artist}, Title: {clean_title}, Album: {clean_album}, Industry: {industry}"
@@ -291,16 +302,13 @@ async def enrich_metadata(
         print(f"🤖 AI Raw: {content}")
 
         # 🛠️ ROBUST MARKDOWN STRIPPER
-        # Detects ```json ... ``` or just ``` ... ``` and extracts the inside
         if "```" in content:
             parts = content.split("```")
-            # Usually the code block is in the middle (index 1)
             if len(parts) >= 3:
                 content = parts[1]
                 if content.startswith("json"):
                     content = content[4:]
             else:
-                # If only one set of backticks or malformed
                 content = content.replace("```json", "").replace("```", "")
         
         content = content.strip()
@@ -317,9 +325,19 @@ async def enrich_metadata(
         print(f"⚠️ Groq API Error: {e}")
         mood, language, genre = "Neutral", "Unknown", "Pop"
 
+    # ✅ FIX: Construct Result matching what Flutter expects
+    # Your Flutter code looks for `sources_used`, so we must send it!
     result = {
         "formatted": f"{mood};{language};{industry};{genre}",
-        "mood": mood, "language": language, "industry": industry, "genre": genre
+        "mood": mood, 
+        "language": language, 
+        "industry": industry, 
+        "genre": genre,
+        "sources_used": {
+            "musicbrainz": mb_data.get("found", False),
+            "is_soundtrack": wiki_data.get("is_soundtrack", False),
+            "wiki_hints": len(wiki_data.get("industry_hints", [])) > 0
+        }
     }
     
     # Save to cache
