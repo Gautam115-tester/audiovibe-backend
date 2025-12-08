@@ -308,7 +308,7 @@ def search_duckduckgo(artist: str, title: str, album: Optional[str] = None) -> d
         response = requests.get(
             "https://api.duckduckgo.com/",
             params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=5
+            timeout=10  # Increased timeout for Render
         )
         
         if response.status_code != 200:
@@ -332,8 +332,11 @@ def search_duckduckgo(artist: str, title: str, album: Optional[str] = None) -> d
             "provider": "duckduckgo",
             "result_count": len(context_parts)
         }
+    except requests.Timeout:
+        print(f"⚠️ DuckDuckGo Timeout (slow network)")
+        return {"success": False, "context": "", "provider": "duckduckgo_timeout"}
     except Exception as e:
-        print(f"DuckDuckGo Error: {e}")
+        print(f"⚠️ DuckDuckGo Error: {e}")
         return {"success": False, "context": "", "provider": "duckduckgo_exception"}
 
 def search_lastfm(artist: str, title: str, album: Optional[str] = None) -> dict:
@@ -352,7 +355,7 @@ def search_lastfm(artist: str, title: str, album: Optional[str] = None) -> dict:
                 "api_key": api_key,
                 "format": "json"
             },
-            timeout=5
+            timeout=10  # Increased timeout
         )
         
         if response.status_code != 200:
@@ -385,8 +388,11 @@ def search_lastfm(artist: str, title: str, album: Optional[str] = None) -> dict:
             "provider": "lastfm",
             "result_count": len(context_parts)
         }
+    except requests.Timeout:
+        print(f"⚠️ Last.fm Timeout (slow network)")
+        return {"success": False, "context": "", "provider": "lastfm_timeout"}
     except Exception as e:
-        print(f"Last.fm Error: {e}")
+        print(f"⚠️ Last.fm Error: {e}")
         return {"success": False, "context": "", "provider": "lastfm_exception"}
 
 # ============================================================
