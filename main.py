@@ -11,13 +11,14 @@ import requests
 import time
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from groq import Groq
 
 # ============================================================
 # 1. LOAD ENVIRONMENT VARIABLES & SETUP
 # ============================================================
 load_dotenv()
 
-app = FastAPI(title="AudioVibe Secure API", version="7.1.0-FreeTier")
+app = FastAPI(title="AudioVibe Secure API", version="7.0.7-AccuracyFix")
 
 # ============================================================
 # 🔐 SECURITY CONFIGURATION
@@ -25,7 +26,6 @@ app = FastAPI(title="AudioVibe Secure API", version="7.1.0-FreeTier")
 
 # ✅ MUST MATCH Flutter's SecurityService._appSecret
 APP_INTEGRITY_SECRET = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
-LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 
 # ⚠️ ALLOWED APP VERSIONS
 ALLOWED_APP_VERSIONS = ["1.0", "1.0.0", "1.0.1", "1.1.0"]
@@ -36,26 +36,29 @@ RATE_LIMIT_MAX_REQUESTS = 100  # requests per window per device
 rate_limit_storage = defaultdict(list)
 
 # ============================================================
-# 2. INITIALIZE CLIENTS (SUPABASE ONLY)
+# 2. INITIALIZE CLIENTS (SUPABASE & GROQ)
 # ============================================================
 
 supabase: Optional[Client] = None
+groq_client: Optional[Groq] = None
 startup_error: Optional[str] = None
+GROQ_MODELS = {"primary": "llama-3.3-70b-versatile"}
 
-# In-memory cache to save API costs/time
+# In-memory cache to save API costs
 metadata_cache = {}
 
 try:
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Supabase Credentials Missing in Environment Variables")
-    
-    if not LASTFM_API_KEY:
-        print("⚠️ Warning: LASTFM_API_KEY is missing. Mood/Genre detection will be limited.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY Missing in Environment Variables")
 
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    groq_client = Groq(api_key=GROQ_API_KEY)
     print("✅ System Online: Clients Initialized Successfully")
 
 except Exception as e:
@@ -82,6 +85,12 @@ class TrackUpload(BaseModel):
     genres: List[str]
     tier_required: str = "free"
 
+class PlayRecord(BaseModel):
+    user_id: str
+    track_id: str
+    listen_time_ms: int
+    total_duration_ms: int
+
 # ============================================================
 # 🛡️ MIDDLEWARE: SECURITY & LOGGING
 # ============================================================
@@ -107,11 +116,13 @@ async def security_middleware(request: Request, call_next):
 
     # 4. Validate Presence
     if not all([timestamp, integrity_hash, device_id, app_version]):
+        print("   ⚠️ REJECTED: Missing Headers")
         return JSONResponse(status_code=403, content={"detail": "Missing security headers"})
 
     # 5. Validate App Version
     if app_version not in ALLOWED_APP_VERSIONS:
-        return JSONResponse(status_code=403, content={"detail": f"Unsupported app version: {app_version}"})
+        print(f"   ⚠️ REJECTED: Unsupported Version '{app_version}'")
+        return JSONResponse(status_code=403, content={"detail": f"Unsupported app version: {app_version}. Allowed: {ALLOWED_APP_VERSIONS}"})
 
     # 6. Validate Timestamp (Replay Attack Protection)
     try:
@@ -120,15 +131,20 @@ async def security_middleware(request: Request, call_next):
         time_diff = abs(current_time - request_time)
 
         if time_diff > 300: # 5 minutes tolerance
+            print(f"   ⚠️ REJECTED: Expired Timestamp (Diff: {time_diff}s)")
             return JSONResponse(status_code=403, content={"detail": "Request expired"})
     except ValueError:
         return JSONResponse(status_code=403, content={"detail": "Invalid timestamp format"})
 
     # 7. Validate Integrity Hash
+    # PAYLOAD = Secret + Timestamp + DeviceID + Version
     payload = f"{APP_INTEGRITY_SECRET}{timestamp}{device_id}{app_version}"
     expected_hash = hashlib.sha256(payload.encode()).hexdigest()
 
     if integrity_hash != expected_hash:
+        print(f"   ❌ REJECTED: Hash Mismatch")
+        print(f"      Expected: {expected_hash}")
+        print(f"      Received: {integrity_hash}")
         return JSONResponse(status_code=403, content={"detail": "Invalid security signature"})
 
     # 8. Rate Limiting
@@ -136,10 +152,12 @@ async def security_middleware(request: Request, call_next):
     rate_limit_storage[device_id] = [t for t in rate_limit_storage[device_id] if current_time - t < RATE_LIMIT_WINDOW]
     
     if len(rate_limit_storage[device_id]) >= RATE_LIMIT_MAX_REQUESTS:
+        print(f"   ⚠️ REJECTED: Rate Limit Exceeded for {device_id}")
         return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
 
     rate_limit_storage[device_id].append(current_time)
 
+    # ✅ Proceed
     response = await call_next(request)
     return response
 
@@ -149,117 +167,22 @@ async def security_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Allow all for development/Flutter
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ============================================================
-# 5. HELPER FUNCTIONS (FREE APIS)
+# 5. HELPER FUNCTIONS
 # ============================================================
 
 def ensure_ready():
     """Stops the request if the backend failed to initialize"""
     if startup_error:
         raise HTTPException(status_code=503, detail=f"Backend Maintenance: {startup_error}")
-    if not supabase:
+    if not supabase or not groq_client:
         raise HTTPException(status_code=503, detail="Backend Initializing...")
-
-def get_lastfm_tags(artist, track):
-    """Free Last.fm tags for mood/genre detection"""
-    if not LASTFM_API_KEY:
-        return {"mood": "Neutral", "genre": "Pop", "tags": []}
-        
-    try:
-        # Step 1: Search for track to get details
-        url = f"http://ws.audioscrobbler.com/2.0/?method=track.getInfo&artist={artist}&track={track}&api_key={LASTFM_API_KEY}&format=json&autocorrect=1"
-        resp = requests.get(url, timeout=3).json()
-        
-        tags = []
-        if "track" in resp and "toptags" in resp["track"]:
-             tag_objs = resp["track"]["toptags"].get("tag", [])
-             # Handle single tag or list of tags
-             if isinstance(tag_objs, dict): tag_objs = [tag_objs]
-             tags = [t["name"].lower() for t in tag_objs]
-
-        # Mappings
-        mood_map = {
-            "romantic": ["love", "romance", "romantic", "ballad"],
-            "sad": ["sad", "melancholy", "heartbreak", "emotional"],
-            "energetic": ["dance", "party", "upbeat", "energy", "workout"],
-            "chill": ["chill", "relax", "acoustic", "lo-fi", "lofi", "ambient"]
-        }
-        
-        genre_map = {
-            "pop": ["pop"],
-            "rock": ["rock", "metal", "indie"],
-            "hip-hop": ["hip-hop", "rap", "trap"],
-            "folk": ["folk", "country"],
-            "bollywood": ["bollywood", "filmi", "hindi"],
-            "devotional": ["devotional", "bhajan", "spiritual"]
-        }
-
-        # Determine Mood
-        detected_mood = "Neutral"
-        for mood, keywords in mood_map.items():
-            if any(k in tags for k in keywords):
-                detected_mood = mood.title()
-                break
-        
-        # Determine Genre
-        detected_genre = "Pop"
-        for genre, keywords in genre_map.items():
-            if any(k in tags for k in keywords):
-                detected_genre = genre.title()
-                break
-
-        return {"mood": detected_mood, "genre": detected_genre, "tags": tags[:10]}
-    except Exception as e:
-        print(f"⚠️ Last.fm Error: {e}")
-        return {"mood": "Neutral", "genre": "Pop", "tags": []}
-
-def detect_language_from_lyrics(artist, title):
-    """Free lyrics language detection via Lyrics.ovh"""
-    try:
-        # Lyrics.ovh is a free public API
-        url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
-        response = requests.get(url, timeout=4)
-        
-        if response.status_code != 200:
-            return {"lang": "Unknown", "industry": None}
-
-        lyrics = response.json().get("lyrics", "")
-        if not lyrics: return {"lang": "Unknown", "industry": None}
-
-        # Character Set Detection logic
-        # Devanagari (Hindi/Marathi)
-        if any("\u0900" <= char <= "\u097F" for char in lyrics):
-            return {"lang": "Hindi", "industry": "Bollywood"}
-        
-        # Telugu
-        if any("\u0C00" <= char <= "\u0C7F" for char in lyrics):
-            return {"lang": "Telugu", "industry": "Tollywood"}
-            
-        # Gurmukhi (Punjabi)
-        if any("\u0A00" <= char <= "\u0A7F" for char in lyrics):
-            return {"lang": "Punjabi", "industry": "Punjabi"}
-            
-        # Tamil
-        if any("\u0B80" <= char <= "\u0BFF" for char in lyrics):
-            return {"lang": "Tamil", "industry": "Kollywood"}
-        
-        # Malayalam
-        if any("\u0D00" <= char <= "\u0D7F" for char in lyrics):
-            return {"lang": "Malayalam", "industry": "Mollywood"}
-
-        # English (ASCII check)
-        if any(ord(c) < 128 for c in lyrics[:100]):
-            return {"lang": "English", "industry": "International"}
-
-        return {"lang": "Unknown", "industry": None}
-    except Exception:
-        return {"lang": "Unknown", "industry": None}
 
 def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> dict:
     try:
@@ -278,37 +201,42 @@ def search_musicbrainz(artist: str, title: str, album: Optional[str] = None) -> 
                 labels = []
                 for rel in rec.get("releases", [])[:3]:
                     if "label-info" in rel:
-                        labels.extend([l.get("label", {}).get("name") for l in rel["label-info"] if l.get("label")])
+                        labels.extend([l.get("label", {}).get("name") for l in rel["label-info"]])
                 return {"found": True, "labels": list(set(labels))[:3], "tags": [t["name"] for t in rec.get("tags", [])][:5]}
     except Exception as e:
         print(f"MusicBrainz Error: {e}")
     return {"found": False, "labels": [], "tags": []}
 
-def detect_industry_python(artist, album, mb_data, lyrics_industry, lastfm_tags):
-    """
-    Combines Signals to determine Industry:
-    1. Lyrics Script (Strongest Signal)
-    2. Last.fm Tags (Strong Signal)
-    3. Keyword Matching (Fallback)
-    """
-    # 1. Strongest: Lyrics Script
-    if lyrics_industry: 
-        return lyrics_industry
+def search_wikipedia(artist: str, album: str) -> dict:
+    try:
+        if not album or album.lower() == "unknown": return {"industry_hints": [], "is_soundtrack": False}
+        response = requests.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "list": "search", "srsearch": f"{album} {artist} album", "format": "json", "srlimit": 3}, timeout=5)
+        if response.status_code == 200:
+            results = response.json().get("query", {}).get("search", [])
+            hints = []
+            is_soundtrack = False
+            for r in results:
+                txt = (r.get("snippet", "") + r.get("title", "")).lower()
+                if "bollywood" in txt or "hindi" in txt: hints.append("Bollywood")
+                if "tollywood" in txt or "telugu" in txt: hints.append("Tollywood")
+                if "kollywood" in txt or "tamil" in txt: hints.append("Kollywood")
+                if "punjabi" in txt: hints.append("Punjabi")
+                
+                if "soundtrack" in txt or "ost" in txt:
+                    is_soundtrack = True
 
-    # 2. Strong: Last.fm Tags
-    tags_str = " ".join(lastfm_tags).lower()
-    if "bollywood" in tags_str: return "Bollywood"
-    if "telugu" in tags_str or "tollywood" in tags_str: return "Tollywood"
-    if "punjabi" in tags_str: return "Punjabi"
-    if "tamil" in tags_str: return "Kollywood"
-    if "k-pop" in tags_str or "kpop" in tags_str: return "K-Pop"
+            if hints or is_soundtrack: 
+                return {"industry_hints": list(set(hints)), "is_soundtrack": is_soundtrack}
+    except Exception: pass
+    return {"industry_hints": [], "is_soundtrack": False}
 
-    # 3. Fallback: Python Keyword Matching
+def detect_industry(artist, album, mb_data, wiki_data):
+    if wiki_data.get("industry_hints"): return wiki_data["industry_hints"][0]
     txt = f"{artist} {album} {' '.join(mb_data.get('labels', []))}".lower()
-    if "bollywood" in txt or "t-series" in txt or "zee music" in txt: return "Bollywood"
-    if "tollywood" in txt or "aditya music" in txt: return "Tollywood"
-    if "punjabi" in txt or "speed records" in txt: return "Punjabi"
-    
+    if "bollywood" in txt: return "Bollywood"
+    if "tollywood" in txt: return "Tollywood"
+    if "kollywood" in txt: return "Kollywood"
+    if "punjabi" in txt: return "Punjabi"
     return "International"
 
 # ============================================================
@@ -318,7 +246,7 @@ def detect_industry_python(artist, album, mb_data, lyrics_industry, lastfm_tags)
 @app.get("/")
 def read_root():
     status = "Maintenance Mode" if startup_error else "Active"
-    return {"status": status, "version": "7.1.0-FreeTier", "error": startup_error}
+    return {"status": status, "version": "7.0.7-AccuracyFix", "error": startup_error}
 
 @app.get("/health")
 def health_check():
@@ -344,37 +272,75 @@ async def enrich_metadata(
 
     print(f"🔍 Analyzing New Track: {clean_title} by {clean_artist}")
     
-    # 1. PARALLEL-ISH EXECUTION (Sequential for now, but fast)
-    # Fetch data from MusicBrainz
+    # 1. External Search
     mb_data = search_musicbrainz(clean_artist, clean_title, clean_album)
+    wiki_data = search_wikipedia(clean_artist, clean_album)
     
-    # Fetch data from Last.fm (Mood/Genre/Tags)
-    lastfm_data = get_lastfm_tags(clean_artist, clean_title)
+    # 2. Basic Python Industry Detection (Used as Hint)
+    detected_industry_python = detect_industry(clean_artist, clean_album, mb_data, wiki_data)
     
-    # Fetch data from Lyrics.ovh (Language/Industry)
-    lyrics_data = detect_language_from_lyrics(clean_artist, clean_title)
-
-    # 2. SYNTHESIZE RESULTS
-    # Determine Language
-    language = lyrics_data["lang"]
-    if language == "Unknown":
-        # Fallback language detection based on industry hints
-        if "bollywood" in lastfm_data["tags"]: language = "Hindi"
-        elif "punjabi" in lastfm_data["tags"]: language = "Punjabi"
-        else: language = "English" # Default fallback
-
-    # Determine Industry
-    final_industry = detect_industry_python(
-        clean_artist, 
-        clean_album, 
-        mb_data, 
-        lyrics_data["industry"], 
-        lastfm_data["tags"]
+    context = f"Artist: {clean_artist}, Title: {clean_title}, Album: {clean_album}, PythonHint: {detected_industry_python}"
+    if mb_data['found']: context += f", Labels: {', '.join(mb_data['labels'])}"
+    
+    # 3. GROQ PROMPT (Refined for Accuracy)
+    prompt = (
+        f"Analyze this song metadata:\n{context}\n\n"
+        "INSTRUCTIONS:\n"
+        "1. MOOD: Pick one (Aggressive, Energetic, Romantic, Melancholic, Chill, Uplifting).\n"
+        "2. LANGUAGE: Detect the language of the LYRICS (e.g. Hindi, Punjabi, Telugu, English). If title is English but lyrics are Hindi/Punjabi, output the lyric language.\n"
+        "3. GENRE: Pick one (Party, Pop, Hip-Hop, Folk, Devotional, LoFi, EDM, Jazz, Classical).\n"
+        "4. INDUSTRY: Detect the film industry or music scene (Bollywood, Tollywood, Kollywood, Mollywood, Punjabi, International, Indie).\n"
+        "   - Use 'Bollywood' for Hindi movie songs.\n"
+        "   - Use 'Tollywood' for Telugu, 'Kollywood' for Tamil.\n"
+        "   - Use 'Punjabi' for Punjabi Pop/Film.\n"
+        "   - Use 'Indie' for independent artists not tied to film.\n"
+        "   - Use 'International' ONLY for English/Western music.\n"
+        "\n"
+        "OUTPUT: Return ONLY raw JSON.\n"
+        "{ \"mood\": \"...\", \"language\": \"...\", \"genre\": \"...\", \"industry\": \"...\" }"
     )
 
-    # Use Last.fm mood/genre
-    mood = lastfm_data["mood"]
-    genre = lastfm_data["genre"]
+    try:
+        chat = groq_client.chat.completions.create(
+            messages=[{"role": "system", "content": "Return valid JSON only. Do not use Markdown."}, {"role": "user", "content": prompt}],
+            model=GROQ_MODELS["primary"], temperature=0.1, response_format={"type": "json_object"}
+        )
+        content = chat.choices[0].message.content.strip()
+        print(f"🤖 AI Raw: {content}")
+
+        # 🛠️ ROBUST MARKDOWN STRIPPER
+        if "```" in content:
+            parts = content.split("```")
+            if len(parts) >= 3:
+                content = parts[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            else:
+                content = content.replace("```json", "").replace("```", "")
+        
+        content = content.strip()
+        
+        data = json.loads(content)
+        mood = data.get("mood", "Neutral").title()
+        language = data.get("language", "Unknown").title()
+        genre = data.get("genre", "Pop").title()
+        
+        # ✅ SMART INDUSTRY LOGIC (UPDATED)
+        # Trust the AI's industry logic first as it has better context
+        ai_industry = data.get("industry", "International").title()
+        
+        # Only fallback to Python hint if AI failed (returned Unknown/International when Python found something specific)
+        if (ai_industry == "International" or ai_industry == "Unknown") and detected_industry_python != "International":
+            final_industry = detected_industry_python
+        else:
+            final_industry = ai_industry
+
+    except json.JSONDecodeError as e:
+        print(f"⚠️ JSON Parse Error: {e} | Content: {content}")
+        mood, language, genre, final_industry = "Neutral", "Unknown", "Pop", detected_industry_python
+    except Exception as e:
+        print(f"⚠️ Groq API Error: {e}")
+        mood, language, genre, final_industry = "Neutral", "Unknown", "Pop", detected_industry_python
 
     # ✅ Construct Result
     result = {
@@ -385,8 +351,9 @@ async def enrich_metadata(
         "genre": genre,
         "sources_used": {
             "musicbrainz": mb_data.get("found", False),
-            "lastfm": bool(lastfm_data["tags"]),
-            "lyrics": lyrics_data["lang"] != "Unknown"
+            "is_soundtrack": wiki_data.get("is_soundtrack", False),
+            "wiki_hints": len(wiki_data.get("industry_hints", [])) > 0,
+            "ai_industry_override": (final_industry != detected_industry_python)
         }
     }
     
@@ -430,6 +397,23 @@ async def add_track(
     except Exception as e:
         print(f"❌ Upload Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/record-play")
+async def record_play(
+    stat: PlayRecord,
+    x_app_timestamp: str = Header(...),
+    x_app_integrity: str = Header(...),
+    x_device_id: str = Header(...),
+    x_app_version: str = Header(...)
+):
+    ensure_ready()
+    try:
+        # Example: Call a Supabase RPC or insert into a table
+        # supabase.table("play_history").insert(stat.dict()).execute()
+        return {"status": "recorded"}
+    except Exception as e:
+        print(f"❌ Stats Error: {e}")
+        return {"status": "error"}
 
 if __name__ == "__main__":
     import uvicorn
