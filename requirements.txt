@@ -1,10 +1,63 @@
-fastapi
-uvicorn
-pydantic
-python-dotenv
-supabase
-groq
-slowapi
-redis
-httpx
-requests
+# ============================================================
+# AudioVibe API - Python Dependencies
+# Version: 7.2.0-MultiSearchProvider
+# ============================================================
+
+# Core Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# HTTP Requests & Web Scraping
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# Data Validation
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Database (Supabase)
+supabase==2.3.0
+postgrest==0.13.2
+storage3==0.7.4
+gotrue==2.3.0
+
+# AI/LLM (Groq)
+groq==0.4.2
+
+# Security & Hashing (built-in hashlib, but including for completeness)
+cryptography==41.0.7
+
+# CORS Support (included in FastAPI, but explicit for clarity)
+python-jose[cryptography]==3.3.0
+
+# Async Support
+httpx==0.26.0
+anyio==4.2.0
+
+# Date/Time utilities
+python-dateutil==2.8.2
+
+# JSON handling (built-in, but better performance)
+orjson==3.9.12
+
+# Type checking
+typing-extensions==4.9.0
+
+# ============================================================
+# Optional: For HTML parsing in ScraperAPI integration
+# ============================================================
+html5lib==1.1
+
+# ============================================================
+# Development Dependencies (Optional - Comment out for production)
+# ============================================================
+# pytest==7.4.4
+# pytest-asyncio==0.23.3
+# black==23.12.1
+# flake8==7.0.0
+# mypy==1.8.0
