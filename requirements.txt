@@ -21,11 +21,11 @@ pydantic-settings==2.1.0
 # Environment Variables
 python-dotenv==1.0.0
 
-# Database (Supabase)
+# Database (Supabase) - Fixed versions
 supabase==2.3.0
 postgrest==0.13.2
 storage3==0.7.4
-gotrue==2.3.0
+gotrue==2.12.4
 
 # AI/LLM (Groq)
 groq==0.4.2
