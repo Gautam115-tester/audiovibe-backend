@@ -1,55 +1,21 @@
-# ============================================================
-# AudioVibe API - Python Dependencies
-# Version: 7.2.0-MultiSearchProvider
-# Python: 3.11.x (NOT 3.13 - has compatibility issues)
-# ============================================================
+# AudioVibe API - Simple Requirements for Render.com
+# Python 3.11.x
 
-# Core Web Framework
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-python-multipart==0.0.12
-
-# HTTP Requests & Web Scraping
-requests==2.32.3
-beautifulsoup4==4.12.3
-lxml==5.3.0
-
-# Data Validation (Updated for compatibility)
-pydantic==2.9.2
-pydantic-settings==2.6.0
-
-# Environment Variables
-python-dotenv==1.0.1
-
-# Database (Supabase) - Latest stable versions
-supabase==2.10.0
-postgrest==0.17.2
-storage3==0.8.1
-gotrue==2.9.1
-realtime==2.0.5
-supafunc==0.5.1
-
-# AI/LLM (Groq)
-groq==0.11.0
-
-# Security & Hashing
-cryptography==43.0.3
-python-jose[cryptography]==3.3.0
-
-# Async Support
-httpx==0.27.2
-anyio==4.6.2.post1
-
-# Date/Time utilities
-python-dateutil==2.9.0.post0
-
-# Type checking
-typing-extensions==4.12.2
-
-# HTML parsing
-html5lib==1.1
-
-# Additional Supabase dependencies
-httpcore==1.0.7
-h11==0.14.0
-certifi==2024.8.30
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+beautifulsoup4
+lxml
+pydantic
+pydantic-settings
+python-dotenv
+supabase
+groq
+cryptography
+python-jose[cryptography]
+httpx
+anyio
+python-dateutil
+typing-extensions
+html5lib
