@@ -1,6 +1,7 @@
 # ============================================================
 # AudioVibe API - Python Dependencies
 # Version: 7.2.0-MultiSearchProvider
+# Python: 3.9+
 # ============================================================
 
 # Core Web Framework
@@ -29,10 +30,8 @@ gotrue==2.3.0
 # AI/LLM (Groq)
 groq==0.4.2
 
-# Security & Hashing (built-in hashlib, but including for completeness)
+# Security & Hashing
 cryptography==41.0.7
-
-# CORS Support (included in FastAPI, but explicit for clarity)
 python-jose[cryptography]==3.3.0
 
 # Async Support
@@ -42,19 +41,17 @@ anyio==4.2.0
 # Date/Time utilities
 python-dateutil==2.8.2
 
-# JSON handling (built-in, but better performance)
+# JSON handling (better performance)
 orjson==3.9.12
 
 # Type checking
 typing-extensions==4.9.0
 
-# ============================================================
-# Optional: For HTML parsing in ScraperAPI integration
-# ============================================================
+# HTML parsing (for ScraperAPI integration)
 html5lib==1.1
 
 # ============================================================
-# Development Dependencies (Optional - Comment out for production)
+# Development Dependencies (Optional - Uncomment if needed)
 # ============================================================
 # pytest==7.4.4
 # pytest-asyncio==0.23.3
