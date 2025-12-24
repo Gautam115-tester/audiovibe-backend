@@ -16,10 +16,10 @@ from supabase import create_client, Client
 from groq import Groq
 
 # ============================================================
-# LOAD ENVIRONMENT & SETUP
+# ENVIRONMENT SETUP
 # ============================================================
 load_dotenv()
-app = FastAPI(title="AudioVibe API", version="11.0.0-PureAI")
+app = FastAPI(title="AudioVibe API", version="13.0.0-PureSpotifyAI")
 
 APP_INTEGRITY_SECRET = os.getenv("APP_INTEGRITY_SECRET", "DONOTTOUCHAPI")
 ALLOWED_APP_VERSIONS = ["1.0", "1.0.0", "1.0.1", "1.1.0"]
@@ -45,11 +45,14 @@ try:
         supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     if GROQ_API_KEY:
         groq_client = Groq(api_key=GROQ_API_KEY)
-    print("✅ System Online: Pure AI-Powered Detection")
+    print("✅ Pure Spotify + AI Detection Engine Online")
 except Exception as e:
     startup_error = str(e)
     print(f"❌ Startup Warning: {e}")
 
+# ============================================================
+# PYDANTIC MODELS
+# ============================================================
 class SongRequest(BaseModel):
     artist: str
     title: str
@@ -72,13 +75,12 @@ class PlayRecord(BaseModel):
     total_duration_ms: int
 
 # ============================================================
-# MIDDLEWARE
+# SECURITY MIDDLEWARE
 # ============================================================
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     if request.url.path in ["/health", "/", "/docs", "/openapi.json", "/favicon.ico"]:
         return await call_next(request)
-    
     if request.method == "OPTIONS":
         return await call_next(request)
     
@@ -89,7 +91,6 @@ async def security_middleware(request: Request, call_next):
     
     if not all([timestamp, integrity_hash, device_id, app_version]):
         return JSONResponse(status_code=403, content={"detail": "Missing headers"})
-    
     if app_version not in ALLOWED_APP_VERSIONS:
         return JSONResponse(status_code=403, content={"detail": "Unsupported version"})
     
@@ -121,23 +122,21 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
-
 def clean_text(text: str) -> str:
+    """Remove special characters and clean text"""
     text = re.sub(r'\(.*?\)|\[.*?\]', '', text)
     text = re.sub(r'feat\.|ft\.|featuring', '', text, flags=re.IGNORECASE)
     return text.strip()
 
 def get_spotify_token() -> Optional[str]:
+    """Get or refresh Spotify access token"""
     global spotify_token_cache
-    
     if spotify_token_cache["token"] and time.time() < spotify_token_cache["expires_at"]:
         return spotify_token_cache["token"]
     
     client_id = os.getenv("SPOTIFY_CLIENT_ID")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-    
     if not client_id or not client_secret:
-        print("⚠️ Spotify credentials missing")
         return None
     
     try:
@@ -146,248 +145,126 @@ def get_spotify_token() -> Optional[str]:
         
         response = requests.post(
             "https://accounts.spotify.com/api/token",
-            headers={
-                "Authorization": f"Basic {b64_auth}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            headers={"Authorization": f"Basic {b64_auth}", "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "client_credentials"},
             timeout=10
         )
         
         if response.status_code == 200:
             data = response.json()
-            token = data["access_token"]
-            expires_in = data["expires_in"]
-            
-            spotify_token_cache["token"] = token
-            spotify_token_cache["expires_at"] = time.time() + expires_in - 300
-            
+            spotify_token_cache["token"] = data["access_token"]
+            spotify_token_cache["expires_at"] = time.time() + data["expires_in"] - 300
             print("✅ Spotify token refreshed")
-            return token
-            
+            return data["access_token"]
     except Exception as e:
-        print(f"❌ Spotify token error: {e}")
+        print(f"❌ Spotify auth error: {e}")
     return None
 
 def search_spotify(artist: str, title: str) -> Dict:
-    """Comprehensive Spotify search with multiple strategies"""
+    """Search Spotify for track data with multiple fallback queries"""
     token = get_spotify_token()
     if not token:
         print("⚠️ Spotify unavailable")
         return {"found": False}
     
     try:
-        # Try multiple query strategies
         queries = [
             f'track:"{title}" artist:"{artist}"',
-            f'"{title}" "{artist}"',
             f'{title} {artist}',
             f'{artist} {title}'
         ]
-        
-        best_match = None
         
         for query in queries:
             try:
                 response = requests.get(
                     "https://api.spotify.com/v1/search",
                     headers={"Authorization": f"Bearer {token}"},
-                    params={
-                        "q": query,
-                        "type": "track",
-                        "limit": 5,
-                        "market": "IN"
-                    },
+                    params={"q": query, "type": "track", "limit": 5, "market": "IN"},
                     timeout=10
                 )
                 
                 if response.status_code == 200:
-                    data = response.json()
-                    tracks = data.get("tracks", {}).get("items", [])
-                    
+                    tracks = response.json().get("tracks", {}).get("items", [])
                     if tracks:
-                        best_match = tracks[0]
-                        print(f"✅ Spotify found: {best_match['name']} by {best_match['artists'][0]['name']}")
-                        break
+                        track = tracks[0]
+                        track_id = track["id"]
                         
+                        print(f"✅ Spotify found: {track['name']} by {track['artists'][0]['name']}")
+                        
+                        # Get audio features
+                        features = {}
+                        try:
+                            f_res = requests.get(
+                                f"https://api.spotify.com/v1/audio-features/{track_id}",
+                                headers={"Authorization": f"Bearer {token}"},
+                                timeout=5
+                            )
+                            if f_res.status_code == 200:
+                                features = f_res.json()
+                        except Exception as e:
+                            print(f"⚠️ Audio features error: {e}")
+                        
+                        # Get artist details
+                        artist_data = {}
+                        try:
+                            artist_id = track["artists"][0]["id"]
+                            a_res = requests.get(
+                                f"https://api.spotify.com/v1/artists/{artist_id}",
+                                headers={"Authorization": f"Bearer {token}"},
+                                timeout=5
+                            )
+                            if a_res.status_code == 200:
+                                artist_data = a_res.json()
+                        except Exception as e:
+                            print(f"⚠️ Artist data error: {e}")
+                        
+                        genres = artist_data.get("genres", [])
+                        print(f"   Genres: {', '.join(genres[:5]) if genres else 'None'}")
+                        
+                        return {
+                            "found": True,
+                            "track": {
+                                "name": track["name"],
+                                "popularity": track.get("popularity", 0)
+                            },
+                            "audio_features": {
+                                "valence": features.get("valence", 0.5),
+                                "energy": features.get("energy", 0.5),
+                                "danceability": features.get("danceability", 0.5),
+                                "acousticness": features.get("acousticness", 0.5),
+                                "instrumentalness": features.get("instrumentalness", 0),
+                                "tempo": features.get("tempo", 120),
+                                "speechiness": features.get("speechiness", 0),
+                                "loudness": features.get("loudness", -5)
+                            },
+                            "artist": {
+                                "name": track["artists"][0]["name"],
+                                "genres": genres,
+                                "popularity": artist_data.get("popularity", 0)
+                            },
+                            "album": {
+                                "name": track["album"]["name"]
+                            }
+                        }
             except Exception as e:
-                print(f"Query attempt failed: {e}")
+                print(f"⚠️ Query failed: {e}")
                 continue
         
-        if not best_match:
-            print("⚠️ Spotify: No results found")
-            return {"found": False}
-        
-        track_id = best_match["id"]
-        
-        # Get audio features
-        audio_features = {}
-        try:
-            features_response = requests.get(
-                f"https://api.spotify.com/v1/audio-features/{track_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5
-            )
-            if features_response.status_code == 200:
-                audio_features = features_response.json()
-        except Exception as e:
-            print(f"Audio features error: {e}")
-        
-        # Get artist details
-        artist_data = {}
-        try:
-            artist_id = best_match["artists"][0]["id"]
-            artist_response = requests.get(
-                f"https://api.spotify.com/v1/artists/{artist_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5
-            )
-            if artist_response.status_code == 200:
-                artist_data = artist_response.json()
-        except Exception as e:
-            print(f"Artist data error: {e}")
-        
-        return {
-            "found": True,
-            "track": {
-                "name": best_match["name"],
-                "popularity": best_match.get("popularity", 0),
-                "explicit": best_match.get("explicit", False),
-                "duration_ms": best_match.get("duration_ms", 0)
-            },
-            "audio_features": {
-                "valence": audio_features.get("valence", 0.5),
-                "energy": audio_features.get("energy", 0.5),
-                "danceability": audio_features.get("danceability", 0.5),
-                "acousticness": audio_features.get("acousticness", 0.5),
-                "instrumentalness": audio_features.get("instrumentalness", 0),
-                "speechiness": audio_features.get("speechiness", 0),
-                "tempo": audio_features.get("tempo", 120),
-                "key": audio_features.get("key", -1),
-                "mode": audio_features.get("mode", 1),
-                "loudness": audio_features.get("loudness", -5)
-            },
-            "artist": {
-                "name": best_match["artists"][0]["name"],
-                "genres": artist_data.get("genres", []),
-                "popularity": artist_data.get("popularity", 0),
-                "followers": artist_data.get("followers", {}).get("total", 0)
-            },
-            "album": {
-                "name": best_match["album"]["name"],
-                "release_date": best_match["album"].get("release_date", ""),
-                "type": best_match["album"].get("album_type", "")
-            }
-        }
-        
-    except Exception as e:
-        print(f"Spotify search error: {e}")
-        return {"found": False}
-
-def search_lastfm(artist: str, title: str) -> Dict:
-    """Last.fm API for additional metadata"""
-    api_key = os.getenv("LASTFM_API_KEY", "")
-    if not api_key:
-        print("⚠️ Last.fm API key missing")
-        return {"found": False}
-    
-    try:
-        response = requests.get(
-            "http://ws.audioscrobbler.com/2.0/",
-            params={
-                "method": "track.getInfo",
-                "api_key": api_key,
-                "artist": artist,
-                "track": title,
-                "format": "json"
-            },
-            timeout=8
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "track" in data:
-                track = data["track"]
-                tags = [t["name"] for t in track.get("toptags", {}).get("tag", [])[:10]]
-                
-                print(f"✅ Last.fm found: {len(tags)} tags")
-                
-                return {
-                    "found": True,
-                    "tags": tags,
-                    "listeners": int(track.get("listeners", 0)),
-                    "playcount": int(track.get("playcount", 0)),
-                    "album": track.get("album", {}).get("title", ""),
-                    "summary": track.get("wiki", {}).get("summary", "")[:500]
-                }
-        
-        print("⚠️ Last.fm: Track not found")
+        print("⚠️ Spotify: No results found")
         return {"found": False}
         
     except Exception as e:
-        print(f"Last.fm error: {e}")
+        print(f"❌ Spotify search error: {e}")
         return {"found": False}
 
-def search_musicbrainz(artist: str, title: str) -> Dict:
-    """MusicBrainz for record labels and release info"""
-    try:
-        clean_artist = clean_text(artist)
-        clean_title = clean_text(title)
-        
-        query = f'recording:"{clean_title}" AND artist:"{clean_artist}"'
-        
-        response = requests.get(
-            "https://musicbrainz.org/ws/2/recording/",
-            params={
-                "query": query,
-                "fmt": "json",
-                "limit": 3
-            },
-            headers={"User-Agent": "AudioVibe/11.0 (support@audiovibe.app)"},
-            timeout=8
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            recordings = data.get("recordings", [])
-            
-            if recordings:
-                rec = recordings[0]
-                
-                labels = []
-                for rel in rec.get("releases", [])[:5]:
-                    if "label-info" in rel:
-                        for label_info in rel["label-info"]:
-                            if label_info.get("label"):
-                                labels.append(label_info["label"].get("name", ""))
-                
-                tags = [t["name"] for t in rec.get("tags", [])[:10]]
-                
-                print(f"✅ MusicBrainz: {len(labels)} labels, {len(tags)} tags")
-                
-                return {
-                    "found": True,
-                    "labels": list(set(labels))[:5],
-                    "tags": tags,
-                    "recording_id": rec.get("id", "")
-                }
-        
-        print("⚠️ MusicBrainz: No results")
-        return {"found": False}
-        
-    except Exception as e:
-        print(f"MusicBrainz error: {e}")
-        return {"found": False}
-
-def analyze_with_groq(artist: str, title: str, album: str, 
-                      spotify_data: Dict, lastfm_data: Dict, mb_data: Dict) -> Dict:
+def analyze_with_ai(artist: str, title: str, album: str, spotify_data: Dict) -> Dict:
     """
-    GROQ AI analyzes ALL data sources to provide accurate metadata.
-    This is the SINGLE source of truth for classification.
+    Pure AI analysis using ONLY Spotify data.
+    AI analyzes genres + audio features to make all classification decisions.
     """
     
     if not groq_client:
-        print("❌ GROQ client unavailable")
+        print("❌ GROQ unavailable - returning fallback")
         return {
             "mood": "Neutral",
             "language": "Unknown",
@@ -395,234 +272,183 @@ def analyze_with_groq(artist: str, title: str, album: str,
             "genre": "Pop"
         }
     
-    # Build comprehensive context
-    context_parts = [
-        f"=== SONG INFORMATION ===",
-        f"Artist: {artist}",
-        f"Title: {title}",
-        f"Album: {album if album else 'Unknown'}",
-        ""
-    ]
+    if not spotify_data.get("found"):
+        print("⚠️ No Spotify data - AI cannot classify")
+        return {
+            "mood": "Neutral",
+            "language": "Unknown",
+            "industry": "International",
+            "genre": "Pop"
+        }
     
-    # Add Spotify data
-    if spotify_data.get("found"):
-        context_parts.append("=== SPOTIFY DATA ===")
-        context_parts.append(f"Track Name: {spotify_data['track']['name']}")
-        context_parts.append(f"Popularity: {spotify_data['track']['popularity']}/100")
-        
-        genres = spotify_data.get("artist", {}).get("genres", [])
-        if genres:
-            context_parts.append(f"Artist Genres: {', '.join(genres[:10])}")
-        
-        features = spotify_data.get("audio_features", {})
-        context_parts.append(f"Audio Features:")
-        context_parts.append(f"  - Valence (happiness): {features.get('valence', 0):.2f} (0=sad, 1=happy)")
-        context_parts.append(f"  - Energy: {features.get('energy', 0):.2f} (0=calm, 1=intense)")
-        context_parts.append(f"  - Danceability: {features.get('danceability', 0):.2f}")
-        context_parts.append(f"  - Acousticness: {features.get('acousticness', 0):.2f}")
-        context_parts.append(f"  - Tempo: {features.get('tempo', 0):.0f} BPM")
-        context_parts.append(f"  - Speechiness: {features.get('speechiness', 0):.2f}")
-        context_parts.append(f"  - Loudness: {features.get('loudness', 0):.1f} dB")
-        context_parts.append("")
+    features = spotify_data.get("audio_features", {})
+    genres = spotify_data.get("artist", {}).get("genres", [])
+    track_name = spotify_data.get("track", {}).get("name", title)
+    artist_name = spotify_data.get("artist", {}).get("name", artist)
+    album_name = spotify_data.get("album", {}).get("name", album or "Unknown")
     
-    # Add Last.fm data
-    if lastfm_data.get("found"):
-        context_parts.append("=== LAST.FM DATA ===")
-        tags = lastfm_data.get("tags", [])
-        if tags:
-            context_parts.append(f"Tags: {', '.join(tags[:15])}")
-        context_parts.append(f"Listeners: {lastfm_data.get('listeners', 0):,}")
-        context_parts.append(f"Playcount: {lastfm_data.get('playcount', 0):,}")
-        context_parts.append("")
-    
-    # Add MusicBrainz data
-    if mb_data.get("found"):
-        context_parts.append("=== MUSICBRAINZ DATA ===")
-        labels = mb_data.get("labels", [])
-        if labels:
-            context_parts.append(f"Record Labels: {', '.join(labels)}")
-        mb_tags = mb_data.get("tags", [])
-        if mb_tags:
-            context_parts.append(f"MB Tags: {', '.join(mb_tags)}")
-        context_parts.append("")
-    
-    context = "\n".join(context_parts)
-    
-    # Enhanced prompt with detailed instructions
-    prompt = f"""{context}
+    context = f"""=== SONG INFORMATION ===
+Artist: {artist_name}
+Title: {track_name}
+Album: {album_name}
+
+=== SPOTIFY GENRES ===
+{', '.join(genres[:10]) if genres else 'No genre data available'}
+
+=== AUDIO FEATURES (Spotify Analysis) ===
+Valence (happiness): {features.get('valence', 0.5):.2f} (0=sad, 1=happy)
+Energy: {features.get('energy', 0.5):.2f} (0=calm, 1=intense)
+Danceability: {features.get('danceability', 0.5):.2f} (0=not danceable, 1=very danceable)
+Acousticness: {features.get('acousticness', 0.5):.2f} (0=electronic, 1=acoustic)
+Speechiness: {features.get('speechiness', 0):.2f} (0=music, 1=speech/rap)
+Instrumentalness: {features.get('instrumentalness', 0):.2f} (0=vocals, 1=instrumental)
+Tempo: {features.get('tempo', 120):.0f} BPM
+Loudness: {features.get('loudness', -5):.1f} dB
 
 === YOUR TASK ===
-Analyze ALL the data above and classify this song into these 4 categories:
+Analyze the Spotify genres and audio features above to classify this song.
 
-1. MOOD (Choose ONE that best fits):
-   - Aggressive: Dark, intense, violent themes, mafia/gang content, heavy bass, high energy + low happiness
-   - Energetic: High energy, danceable, party vibes, club music, fast tempo
-   - Romantic: Love songs, emotional, moderate energy, acoustic elements
-   - Melancholic: Sad, breakup, introspective, low valence/happiness
-   - Chill: Relaxed, lo-fi, calm, low energy
-   - Uplifting: Happy, motivational, high valence, inspiring
-   
-   **Decision guide for MOOD:**
-   - If valence < 0.4 AND energy > 0.7 → Aggressive
-   - If valence < 0.35 → Melancholic
-   - If energy > 0.75 AND danceability > 0.7 → Energetic
-   - If valence > 0.7 → Uplifting
-   - If energy < 0.5 → Chill
-   - If acousticness > 0.4 AND 0.4 < valence < 0.7 → Romantic
+1. MOOD (choose ONE):
+   - Aggressive: High energy + Low valence + Fast tempo (mafia, gang, dark themes)
+   - Energetic: High energy + High danceability (party, club, upbeat)
+   - Romantic: Moderate energy + Mid valence + Acoustic (love songs)
+   - Melancholic: Low valence (sad, emotional, breakup)
+   - Chill: Low energy + Mid valence (relaxed, lo-fi, calm)
+   - Uplifting: High valence + Moderate energy (happy, motivational)
 
-2. LANGUAGE (The actual lyrics language, NOT the title language):
-   - Hindi: Bollywood songs, Hindi film music, mainstream Indian pop
-   - Punjabi: Punjabi artists (Honey Singh, Sidhu, AP Dhillon, Badshah), even if title is English
-   - Telugu: Tollywood, South Indian Telugu cinema
-   - Tamil: Kollywood, Tamil cinema
-   - Malayalam: Malayalam cinema
-   - English: Western/International artists only
-   - Unknown: Only if absolutely no information available
-   
-   **Decision guide for LANGUAGE:**
-   - If artist genres contain "punjabi", "desi hip hop" → Punjabi
-   - If artist genres contain "bollywood", "filmi" → Hindi
-   - If artist genres contain "tollywood", "telugu" → Telugu
-   - If artist genres contain "tamil", "kollywood" → Tamil
-   - If artist is Western/International → English
-   - Examples: "Yo Yo Honey Singh" → Punjabi (even if song title is English)
+2. LANGUAGE (lyrics language - analyze Spotify genres):
+   - If genres contain "punjabi", "bhangra", "desi hip hop" → Punjabi
+   - If genres contain "bollywood", "filmi", "hindi" → Hindi
+   - If genres contain "tollywood", "telugu" → Telugu
+   - If genres contain "kollywood", "tamil" → Tamil
+   - If genres contain "mollywood", "malayalam" → Malayalam
+   - If genres are Western (pop, rock, hip hop, etc.) → English
+   - Default → Unknown (ONLY if no genre data)
 
-3. INDUSTRY (Choose ONE):
-   - Bollywood: Hindi film industry, mainstream Indian cinema (T-Series, Zee Music, YRF, Eros)
-   - Punjabi: Punjabi music industry (independent or Punjabi cinema)
-   - Tollywood: Telugu film industry
-   - Kollywood: Tamil film industry
-   - Mollywood: Malayalam film industry
-   - Indie: Independent artists, non-film music
-   - International: Western/English music
-   
-   **Decision guide for INDUSTRY:**
-   - If Spotify genres include "punjabi" → Punjabi
-   - If Spotify genres include "bollywood" → Bollywood
-   - If labels include "T-Series", "Zee Music", "YRF" → Bollywood
-   - If labels include "Speed Records", "White Hill" → Punjabi
-   - If Western artist with English language → International
+3. INDUSTRY (music industry):
+   - Punjabi: Punjabi music scene (punjabi, bhangra genres)
+   - Bollywood: Hindi film industry (bollywood, filmi genres)
+   - Tollywood: Telugu film industry (tollywood, telugu genres)
+   - Kollywood: Tamil film industry (kollywood, tamil genres)
+   - Mollywood: Malayalam film industry (mollywood genres)
+   - International: Western music (pop, rock, hip hop, etc.)
+   - Indie: Independent artists (indie, alternative genres)
 
-4. GENRE (Choose ONE):
-   - Hip-Hop: Rap, trap, urban music, hip hop beats
-   - Party: Club bangers, EDM, high energy dance
-   - Pop: Mainstream, catchy, radio-friendly
-   - Folk: Traditional, acoustic, cultural
-   - Devotional: Religious, spiritual, bhajans
-   - LoFi: Chill beats, study music
-   - EDM: Electronic dance music, house, techno
-   - Rock: Guitar-driven, alternative, metal
-   - Jazz: Jazz, blues, swing
-   - Classical: Traditional instruments, ragas
+4. GENRE (music style - analyze BOTH Spotify genres AND audio features):
+   - Hip-Hop: Spotify genres contain "hip hop", "rap", "trap", "desi hip hop" OR speechiness > 0.33
+   - Party: Spotify genres contain "party", "club" OR (danceability > 0.8 AND energy > 0.75)
+   - Pop: Spotify genres contain "pop" (bollywood pop, dance pop, etc.)
+   - Folk: Spotify genres contain "folk", "traditional", "bhangra" OR acousticness > 0.7
+   - EDM: Spotify genres contain "edm", "house", "techno", "electronic", "trance"
+   - Rock: Spotify genres contain "rock", "metal", "alternative", "indie rock"
+   - Jazz: Spotify genres contain "jazz", "blues", "swing"
+   - Classical: Spotify genres contain "classical", "carnatic", "hindustani", "symphony"
+   - LoFi: Spotify genres contain "lo-fi", "lofi" OR (energy < 0.4 AND instrumentalness > 0.5)
+   - Devotional: Spotify genres contain "devotional", "bhajan", "spiritual", "worship"
    
-   **Decision guide for GENRE:**
-   - If Spotify genres contain "hip hop", "rap", "trap" → Hip-Hop
-   - If Spotify genres contain "edm", "house", "electronic" → EDM
-   - If danceability > 0.8 AND energy > 0.75 → Party
-   - If acousticness > 0.6 → Folk
-   - Default to → Pop
+   IMPORTANT: Use BOTH genre keywords AND audio features to make the best decision.
+   If Spotify genres clearly indicate a genre, trust that first.
+   If genres are vague or missing, use audio features as backup.
 
 === EXAMPLES ===
-Example 1: "Mafia" by Yo Yo Honey Singh
-- Mood: Aggressive (dark theme, mafia content)
-- Language: Punjabi (Honey Singh is Punjabi artist)
-- Industry: Punjabi (not Bollywood film)
-- Genre: Hip-Hop (rap/hip hop style)
+Example 1: Genres: ["punjabi hip hop", "desi hip hop"]
+Audio: valence=0.35, energy=0.82, danceability=0.72, speechiness=0.25, tempo=140
+Analysis: Genres clearly indicate "hip hop" → Hip-Hop
+→ {{"mood": "Aggressive", "language": "Punjabi", "industry": "Punjabi", "genre": "Hip-Hop"}}
 
-Example 2: "Kesariya" by Arijit Singh
-- Mood: Romantic (love song from movie)
-- Language: Hindi (Bollywood song)
-- Industry: Bollywood (from film Brahmastra)
-- Genre: Pop (mainstream Bollywood pop)
+Example 2: Genres: ["bollywood", "filmi"]
+Audio: valence=0.52, energy=0.45, acousticness=0.73, danceability=0.45
+Analysis: Genres indicate "bollywood" (which is pop-style), audio is romantic
+→ {{"mood": "Romantic", "language": "Hindi", "industry": "Bollywood", "genre": "Pop"}}
 
-Example 3: "Brown Munde" by AP Dhillon
-- Mood: Energetic (party vibe)
-- Language: Punjabi
-- Industry: Punjabi (independent Punjabi)
-- Genre: Hip-Hop
+Example 3: Genres: ["pop", "dance pop"]
+Audio: valence=0.75, energy=0.73, danceability=0.85, acousticness=0.15
+Analysis: Genres say "pop", high danceability confirms party/dance style
+→ {{"mood": "Energetic", "language": "English", "industry": "International", "genre": "Pop"}}
 
-=== OUTPUT FORMAT ===
-Return ONLY valid JSON, no markdown, no explanation:
-{{
-  "mood": "Aggressive",
-  "language": "Punjabi",
-  "industry": "Punjabi",
-  "genre": "Hip-Hop",
-  "reasoning": "Brief 1-sentence explanation of each choice"
-}}
+Example 4: Genres: ["electronic", "house"]
+Audio: valence=0.65, energy=0.88, danceability=0.90, acousticness=0.05
+Analysis: Genres clearly indicate "electronic" + "house" → EDM
+→ {{"mood": "Energetic", "language": "English", "industry": "International", "genre": "EDM"}}
 
-**CRITICAL RULES:**
-- NEVER return "Neutral" or "Unknown" if you have ANY data
-- Trust Spotify audio features (valence, energy) for mood
-- Trust Spotify genres for language/industry
-- Punjabi artists → Punjabi language (even if title is English)
-- Use examples as reference for similar songs
-"""
+Example 5: Genres: ["indie folk", "singer-songwriter"]
+Audio: valence=0.55, energy=0.35, acousticness=0.85, danceability=0.30
+Analysis: Genres say "folk", high acousticness confirms → Folk
+→ {{"mood": "Chill", "language": "English", "industry": "Indie", "genre": "Folk"}}
+
+Example 6: Genres: [] (No genre data)
+Audio: valence=0.40, energy=0.30, acousticness=0.20, speechiness=0.45, danceability=0.55
+Analysis: No genres, but high speechiness indicates rap/hip-hop → Hip-Hop
+→ {{"mood": "Chill", "language": "Unknown", "industry": "International", "genre": "Hip-Hop"}}
+
+=== OUTPUT ===
+Return ONLY valid JSON (no markdown, no explanation):
+{{"mood": "...", "language": "...", "industry": "...", "genre": "..."}}
+
+Be decisive. Trust the Spotify genres - they are expert-curated. Use audio features to confirm or override when needed."""
 
     try:
-        print("🤖 Sending comprehensive data to GROQ AI...")
+        print("🤖 Sending to AI for analysis...")
         
         chat = groq_client.chat.completions.create(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an expert music analyst. Analyze data carefully and return ONLY valid JSON. Be decisive - never return Unknown or Neutral if you have data."
+                    "content": "You are an expert music classifier. Analyze Spotify data (genres + audio features) and return ONLY valid JSON. Be decisive - make the best choice using all available data."
                 },
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": context
                 }
             ],
             model=GROQ_MODELS["primary"],
-            temperature=0.1,  # Low temperature for consistency
-            max_tokens=500,
+            temperature=0.1,
+            max_tokens=300,
             response_format={"type": "json_object"}
         )
         
         content = chat.choices[0].message.content.strip()
-        
-        # Aggressive cleanup
         content = content.replace("```json", "").replace("```", "").strip()
         if content.startswith("json"):
             content = content[4:].strip()
         
         result = json.loads(content)
         
-        print(f"✅ AI Analysis Complete:")
-        print(f"   Mood: {result.get('mood')}")
-        print(f"   Language: {result.get('language')}")
-        print(f"   Industry: {result.get('industry')}")
-        print(f"   Genre: {result.get('genre')}")
-        
-        return {
+        final = {
             "mood": result.get("mood", "Neutral").title(),
             "language": result.get("language", "Unknown").title(),
             "industry": result.get("industry", "International").title(),
-            "genre": result.get("genre", "Pop").title(),
-            "reasoning": result.get("reasoning", "")
+            "genre": result.get("genre", "Pop").title()
         }
+        
+        print(f"✅ AI Classification:")
+        print(f"   Mood: {final['mood']}")
+        print(f"   Language: {final['language']}")
+        print(f"   Industry: {final['industry']}")
+        print(f"   Genre: {final['genre']}")
+        
+        return final
         
     except json.JSONDecodeError as e:
         print(f"❌ JSON Parse Error: {e}")
-        print(f"Raw response: {content}")
+        print(f"   Raw response: {content}")
         return {
             "mood": "Neutral",
             "language": "Unknown",
             "industry": "International",
-            "genre": "Pop",
-            "reasoning": "Parse error"
+            "genre": "Pop"
         }
     except Exception as e:
-        print(f"❌ GROQ AI Error: {e}")
+        print(f"❌ AI Error: {e}")
         return {
             "mood": "Neutral",
             "language": "Unknown",
             "industry": "International",
-            "genre": "Pop",
-            "reasoning": str(e)
+            "genre": "Pop"
         }
 
 def ensure_ready():
+    """Check if backend services are ready"""
     if startup_error:
         raise HTTPException(status_code=503, detail=f"Maintenance: {startup_error}")
 
@@ -632,24 +458,24 @@ def ensure_ready():
 
 @app.get("/")
 def read_root():
+    """Root endpoint - API info"""
     return {
-        "status": "Active" if not startup_error else "Maintenance",
-        "version": "11.0.0-PureAI",
-        "detection": "100% AI-Powered (Spotify + Last.fm + MusicBrainz + GROQ)",
+        "status": "Active",
+        "version": "13.0.0-PureSpotifyAI",
+        "method": "Pure AI analysis of Spotify data (genres + audio features)",
         "sources": {
             "spotify": "✅" if os.getenv("SPOTIFY_CLIENT_ID") else "⚠️ Missing",
-            "lastfm": "✅" if os.getenv("LASTFM_API_KEY") else "⚠️ Missing",
-            "musicbrainz": "✅ Always Available",
             "groq": "✅" if groq_client else "⚠️ Missing"
         }
     }
 
 @app.get("/health")
 def health_check():
+    """Health check endpoint"""
     return {
-        "status": "healthy" if not startup_error else "unhealthy",
-        "spotify_token": "✅" if spotify_token_cache.get("token") else "⚠️",
-        "groq": "✅" if groq_client else "❌"
+        "status": "healthy",
+        "spotify": "✅" if spotify_token_cache.get("token") else "⚠️",
+        "groq": "✅" if groq_client else "⚠️"
     }
 
 @app.post("/enrich-metadata")
@@ -660,6 +486,7 @@ async def enrich_metadata(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
+    """Main endpoint - Enrich song metadata using Spotify + AI"""
     ensure_ready()
     
     clean_title = clean_text(song.title)
@@ -671,49 +498,23 @@ async def enrich_metadata(
     if cache_key in metadata_cache:
         cached = metadata_cache[cache_key]
         if time.time() - cached.get("cached_at", 0) < CACHE_TTL:
-            print(f"💾 Returning cached result for: {clean_title}")
+            print(f"💾 Cache hit: {clean_title}")
             return cached["data"]
     
     print(f"\n🎵 ==========================================")
     print(f"🎵 Analyzing: '{clean_title}' by {clean_artist}")
     print(f"🎵 ==========================================")
     
-    # STEP 1: Gather data from all sources
-    print("\n📡 Fetching data from sources...")
+    # Get Spotify data
     spotify_data = search_spotify(clean_artist, clean_title)
-    lastfm_data = search_lastfm(clean_artist, clean_title)
-    mb_data = search_musicbrainz(clean_artist, clean_title)
     
-    # STEP 2: Let AI analyze everything
-    print("\n🤖 Sending to GROQ AI for comprehensive analysis...")
-    ai_result = analyze_with_groq(
-        clean_artist, clean_title, clean_album,
-        spotify_data, lastfm_data, mb_data
-    )
-    
-    # Calculate confidence score
-    confidence_score = 0
-    sources_used = []
-    
-    if spotify_data.get("found"):
-        confidence_score += 50
-        sources_used.append("spotify")
-    if lastfm_data.get("found"):
-        confidence_score += 25
-        sources_used.append("lastfm")
-    if mb_data.get("found"):
-        confidence_score += 10
-        sources_used.append("musicbrainz")
-    if groq_client:
-        confidence_score += 15
-        sources_used.append("groq_ai")
-    
-    print(f"\n✅ Final Classification:")
-    print(f"   📊 {ai_result['mood']};{ai_result['language']};{ai_result['industry']};{ai_result['genre']}")
-    print(f"   🎯 Confidence: {confidence_score}%")
-    print(f"   📚 Sources: {', '.join(sources_used)}")
+    # Let AI analyze
+    ai_result = analyze_with_ai(clean_artist, clean_title, clean_album, spotify_data)
     
     # Build result
+    confidence_score = 90 if spotify_data.get("found") else 0
+    sources = ["spotify", "groq_ai"] if spotify_data.get("found") else []
+    
     result = {
         "formatted": f"{ai_result['mood']};{ai_result['language']};{ai_result['industry']};{ai_result['genre']}",
         "mood": ai_result["mood"],
@@ -721,35 +522,22 @@ async def enrich_metadata(
         "industry": ai_result["industry"],
         "genre": ai_result["genre"],
         "confidence_score": confidence_score,
-        "sources_used": sources_used,
-        "ai_reasoning": ai_result.get("reasoning", ""),
+        "sources_used": sources,
         "raw_data": {
             "spotify": {
                 "found": spotify_data.get("found", False),
                 "genres": spotify_data.get("artist", {}).get("genres", [])[:5] if spotify_data.get("found") else [],
-                "popularity": spotify_data.get("track", {}).get("popularity", 0) if spotify_data.get("found") else 0,
                 "audio_features": spotify_data.get("audio_features", {}) if spotify_data.get("found") else {}
-            },
-            "lastfm": {
-                "found": lastfm_data.get("found", False),
-                "tags": lastfm_data.get("tags", [])[:5] if lastfm_data.get("found") else [],
-                "listeners": lastfm_data.get("listeners", 0) if lastfm_data.get("found") else 0
-            },
-            "musicbrainz": {
-                "found": mb_data.get("found", False),
-                "labels": mb_data.get("labels", [])[:3] if mb_data.get("found") else [],
-                "tags": mb_data.get("tags", [])[:5] if mb_data.get("found") else []
             }
         }
     }
     
-    # Cache the result
-    metadata_cache[cache_key] = {
-        "data": result,
-        "cached_at": time.time()
-    }
-    
+    print(f"\n✅ Final Result: {result['formatted']}")
+    print(f"   Confidence: {confidence_score}%")
     print(f"🎵 ==========================================\n")
+    
+    # Cache result
+    metadata_cache[cache_key] = {"data": result, "cached_at": time.time()}
     
     return result
 
@@ -760,12 +548,12 @@ async def get_tracks(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
+    """Get all tracks from database"""
     ensure_ready()
     try:
         response = supabase.table("music_tracks").select("*").order("created_at", desc=True).execute()
         return response.data
     except Exception as e:
-        print(f"❌ Database error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
 
 @app.post("/tracks")
@@ -776,12 +564,12 @@ async def add_track(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
+    """Add new track to database"""
     ensure_ready()
     try:
         response = supabase.table("music_tracks").insert(track.dict()).execute()
         return {"status": "success", "data": response.data}
     except Exception as e:
-        print(f"❌ Upload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/record-play")
@@ -792,15 +580,13 @@ async def record_play(
     x_device_id: str = Header(...),
     x_app_version: str = Header(...)
 ):
+    """Record play statistics"""
     ensure_ready()
-    try:
-        # Uncomment when ready to store play statistics
-        # supabase.table("play_history").insert(stat.dict()).execute()
-        return {"status": "recorded"}
-    except Exception as e:
-        print(f"❌ Play record error: {e}")
-        return {"status": "error", "message": str(e)}
+    return {"status": "recorded"}
 
+# ============================================================
+# RUN SERVER
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
